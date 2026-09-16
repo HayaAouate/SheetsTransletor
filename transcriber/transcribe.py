@@ -109,12 +109,16 @@ def transcribe_audio(
     notes = _drop_weak_notes(notes)
 
     bpm, beat_origin = detect_tempo(tempo_audio_path or audio_path)
+    bpm = _readable_tempo(bpm, notes)
     bpm, beat_origin = _refine_grid(notes, bpm, beat_origin)
     log.info("Tempo : %.1f bpm, origine=%.3fs", bpm, beat_origin)
     mono = _clean_and_quantize(notes, bpm, beat_origin)
     mono = _merge_false_splits(mono, audio_path)
+    mono = _drop_leading_bleed(mono)
     shift = _align_downbeat(mono)
     beat_origin -= shift * (60.0 / bpm * GRID)  # slots moved by +shift -> origin moves by -shift
+    mono = _simplify_rhythm(mono)
+    log.info("Rythme : %d notes, grille %s", len(mono), "croche" if _choose_unit(mono) == 2 else "double-croche")
     return Transcription(notes=mono, bpm=bpm, beat_origin=beat_origin, instrument=instrument)
 
 
@@ -126,18 +130,117 @@ def _drop_weak_notes(notes, ratio: float = 0.45):
     return [n for n in notes if n.amplitude >= floor]
 
 
-def _merge_false_splits(mono, audio_path: str, dip_ratio: float = 0.5):
+def _readable_tempo(bpm: float, notes) -> float:
+    """
+    Beat trackers sometimes lock on half or double the felt tempo. For notation the difference is
+    huge: at half tempo every eighth note is written as a sixteenth. Only the extreme cases are
+    corrected, from the spacing between note onsets (not their sounded length, which depends on
+    how the note decays): a melody whose typical note-to-note spacing is a sixteenth or less is
+    written at double tempo, one whose notes are two beats apart or more at half tempo.
+    """
+    if len(notes) < 8:
+        return bpm
+    onsets = np.array(sorted(n.start for n in notes))
+    ioi = np.diff(onsets)
+    ioi = ioi[ioi > 0.03]  # ignore near-simultaneous detections (octave ghosts)
+    if len(ioi) < 6:
+        return bpm
+    beats = float(np.median(ioi)) * bpm / 60.0
+    if beats < 0.35 and bpm * 2 <= 200:
+        return bpm * 2
+    if beats > 1.75 and bpm / 2 >= 55:
+        return bpm / 2
+    return bpm
+
+
+def _drop_leading_bleed(mono, ratio: float = 0.6, lead_beats: float = 2.0):
+    """
+    Quiet notes long before the first real note are separation bleed (voice, drums...), not music:
+    keeping them produces empty-looking bars at the top of the score. Anything within `lead_beats`
+    of the first real note is kept as a possible pickup.
+    """
+    if len(mono) < 4:
+        return mono
+    threshold = ratio * max(n.amplitude for n in mono)
+    real = [n for n in mono if n.amplitude >= threshold]
+    # The melody starts where real notes come in a row, not at an isolated loud blip 10 s earlier.
+    first = next((n for i, n in enumerate(real)
+                  if len([m for m in real[i + 1:] if m.slot - n.slot <= 8 * SLOTS_PER_BEAT]) >= 2),
+                 real[0] if real else mono[0])
+    limit = first.slot - lead_beats * SLOTS_PER_BEAT
+    return [n for n in mono if n.slot >= limit]
+
+
+def _choose_unit(mono, max_lost: float = 0.20) -> int:
+    """Rhythmic unit in grid slots: 2 (eighth notes) unless that would merge > 20 % of the notes."""
+    if len(mono) < 4:
+        return 2
+    seen, lost = set(), 0
+    for n in mono:
+        s = _snap(n.slot, 2)
+        lost += s in seen
+        seen.add(s)
+    return 2 if lost / len(mono) <= max_lost else 1
+
+
+def _snap(slot: int, unit: int) -> int:
+    """Nearest multiple of `unit`, halves rounded up (Python's round() rounds them to even, which
+    would pair slots inconsistently and create phantom collisions)."""
+    return int(np.floor(slot / unit + 0.5)) * unit
+
+
+NICE_LENGTHS = (1, 2, 3, 4, 6, 8, 12, 16)  # in units: 8th, quarter, dotted quarter, half, ... whole
+
+
+def _simplify_rhythm(mono):
+    """
+    Make the written rhythm as simple as a musician would write it by hand:
+      * onsets on the eighth-note grid when the music allows it (sixteenths only if needed),
+      * a gap shorter than a beat before the next note is not a rest, the note just lasts longer
+        (Basic Pitch stops a note when it decays, a player would hold it),
+      * durations rounded to standard values (no double dots, no 5-sixteenths-tied-to-something).
+    """
+    if not mono:
+        return mono
+    unit = _choose_unit(mono)
+    best = {}
+    for n in mono:  # collisions on the coarser grid: keep the louder / longer note
+        s = _snap(n.slot, unit)
+        cur = best.get(s)
+        if cur is None or (n.amplitude, n.length) > (cur.amplitude, cur.length):
+            n.slot = s
+            best[s] = n
+    mono = [best[s] for s in sorted(best)]
+
+    beat_units = SLOTS_PER_BEAT // unit
+    for i, n in enumerate(mono):
+        sounded = max(1, int(round(n.length / unit)))
+        if i + 1 < len(mono):
+            room = (mono[i + 1].slot - n.slot) // unit  # units until the next onset
+            if room - sounded < beat_units:  # short gap -> legato, no fiddly rest
+                sounded = room
+        else:
+            room = max(sounded, 1)
+        # Always a standard value (music21 would otherwise write a double-dotted note); what is
+        # left before the next note becomes a rest, split cleanly on the beats by the notation.
+        length = max(v for v in NICE_LENGTHS if v <= max(1, min(sounded, room)))
+        n.length = max(1, min(length, room)) * unit
+    return mono
+
+
+def _merge_false_splits(mono, audio_path: str, dip_ratio: float = 0.4):
     """
     Basic Pitch cuts a sustained note in two whenever its onset detector fires, which drum bleed in
     a separated stem does at every hi-hat. Two contiguous same-pitch notes are re-joined unless the
     audio shows a real re-attack at the split: an energy dip right before the second note starts
-    (a sustained note that merely gets a drum hit on top never dips).
+    (a sustained note that merely gets a drum hit on top never dips). The dip must be deep: vibrato
+    or tremolo modulate the level by 10-30 %, a re-bowed / re-plucked note drops well below half.
     """
     if len(mono) < 2:
         return mono
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
-    hop = 128  # ~6 ms resolution
-    rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop)[0]
+    hop = 64  # ~3 ms resolution; short frames so that a quick re-attack of the same note shows as a dip
+    rms = librosa.feature.rms(y=y, frame_length=256, hop_length=hop)[0]
     times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
 
     def rms_between(t0, t1, reduce):
@@ -178,9 +281,10 @@ def detect_tempo(audio_path: str):
         return bpm, 0.0
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
     if len(beat_times) >= 8:
-        # The global tempo estimate is coarse (~0.5 bpm); a linear fit through the tracked beats
-        # gives the mean beat period far more precisely, which matters over a 3-minute song.
-        period, _ = np.polyfit(np.arange(len(beat_times)), beat_times, 1)
+        # The global tempo estimate is coarse (~0.5 bpm); the median beat interval is far more
+        # precise (and, unlike a linear fit, immune to the odd skipped/doubled beat), which matters
+        # over a 3-minute song where 1 % of error drifts the grid by several beats.
+        period = float(np.median(np.diff(beat_times)))
         fitted = 60.0 / period
         while fitted < 70:
             fitted *= 2
@@ -214,12 +318,17 @@ def _refine_grid(notes, bpm: float, coarse_origin: float):
         return float(np.sum(weights * dist**2))
 
     best = (cost(bpm, coarse_origin), bpm, coarse_origin)
-    for b in bpm * np.linspace(0.985, 1.015, 31):
-        grid_sec = 60.0 / b * GRID
-        for phase in coarse_origin + np.linspace(-grid_sec / 2, grid_sec / 2, 25):
-            c = cost(b, phase)
-            if c < best[0]:
-                best = (c, float(b), float(phase))
+    # Coarse pass (±10 %: beat trackers are regularly 5-8 % off, e.g. 121 for a song at 130), then a
+    # fine pass around the winner: the onsets are precise to ~10 ms, so the tempo can be pinned to
+    # ~0.1 bpm. A wrong tempo spreads the onsets uniformly over the grid, so the true one stands out.
+    for span, steps in ((0.10, 401), (0.002, 41)):
+        center = best[1]
+        for b in center * np.linspace(1 - span, 1 + span, steps):
+            grid_sec = 60.0 / b * GRID
+            for phase in coarse_origin + np.linspace(-grid_sec / 2, grid_sec / 2, 25):
+                c = cost(b, phase)
+                if c < best[0]:
+                    best = (c, float(b), float(phase))
     return best[1], best[2]
 
 
@@ -274,12 +383,27 @@ def _align_downbeat(mono) -> int:
         apply(shift)
         total += shift
 
-    # 2. Downbeat: without drums there is no reliable way to find bar lines, so use the predictable
-    #    convention "measure 1 starts on the beat of the first real note" (a pickup will be off by
-    #    a beat, easy to fix in MuseScore). "Real" = loud enough not to be separation bleed.
+    # 2. Bar lines: of the 4 possible beat offsets, keep the one where long/loud notes start on
+    #    downbeats and few notes straddle a bar line (a note tied across the bar is what a wrong
+    #    bar line produces). Then start measure 1 on the bar of the first real note ("real" = loud
+    #    enough not to be separation bleed).
     threshold = 0.6 * max(n.amplitude for n in mono)
+
+    def bar_score(k):
+        score = 0.0
+        for n in mono:
+            pos = (n.slot - k * SLOTS_PER_BEAT) % SLOTS_PER_BAR
+            weight = n.amplitude * n.length
+            if pos == 0:
+                score += weight
+            if pos + n.length > SLOTS_PER_BAR:
+                score -= 0.5 * weight
+        return score
+
+    k = max(range(4), key=bar_score)
     first = next((n for n in mono if n.amplitude >= threshold), mono[0])
-    shift = -(first.slot // SLOTS_PER_BEAT) * SLOTS_PER_BEAT
+    first_bar = (first.slot - k * SLOTS_PER_BEAT) // SLOTS_PER_BAR
+    shift = -(k * SLOTS_PER_BEAT + first_bar * SLOTS_PER_BAR)
     if shift:
         apply(shift)
         total += shift

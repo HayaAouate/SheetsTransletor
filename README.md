@@ -18,7 +18,9 @@ Pipeline : [Demucs](https://github.com/facebookresearch/demucs) (Meta, open sour
 3. **Lilypond** (génération des PDF de partition).
    Windows : `winget install LilyPond.LilyPond` (ou https://lilypond.org/download.html).
    Vérifie avec : `lilypond --version`
-   (Redémarre le terminal après installation si la commande n'est pas reconnue.)
+
+   (FFmpeg et Lilypond n'ont pas besoin d'être dans le PATH : l'app les cherche aussi dans les dossiers
+   d'installation habituels — winget, Program Files — au démarrage.)
 
 ## Installation du projet
 

@@ -2,8 +2,8 @@
 
 Lancer avec :  streamlit run app.py
 """
-import io
 import logging
+import re
 import os
 import tempfile
 import time
@@ -11,12 +11,14 @@ import time
 import numpy as np
 import soundfile as sf
 import streamlit as st
+import streamlit.components.v1 as components
 
 from transcriber.audio_input import get_audio_path
 from transcriber.guitar_tabs import build_tab, export_tab_pdf, render_ascii_tab
-from transcriber.notation import CREDIT, configure_lilypond, export_pdf, transcription_to_score
+from transcriber.notation import CREDIT, configure_lilypond, export_pdf, key_label, transcription_to_score
 from transcriber.separate import DEFAULT_STEM, STEM_CHOICES, isolate_stem
 from transcriber.transcribe import transcribe_audio
+from transcriber.viewer import audio_data_uri, build_viewer_html
 
 # Logs dans le terminal qui a lancé `streamlit run` : une ligne par étape du pipeline.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
@@ -26,7 +28,7 @@ st.set_page_config(page_title="SheetsTranslator", page_icon="🎻")
 st.title("🎻 SheetsTranslator — Audio → Partition")
 st.caption("MVP interne — transcription violon (partition) et guitare (tablature) à partir d'un fichier ou d'un lien YouTube.")
 
-configure_lilypond()  # nécessite Lilypond installé et accessible dans le PATH (voir README)
+configure_lilypond()  # trouve Lilypond + FFmpeg tout seul (PATH ou dossiers d'installation connus)
 
 instrument_choice = st.radio("Instrument", ["Violon", "Guitare"], horizontal=True)
 instrument_key = "Violin" if instrument_choice == "Violon" else "Guitar"
@@ -68,122 +70,134 @@ with st.expander("Réglages avancés"):
         help="Les notes plus courtes sont considérées comme du bruit et supprimées.",
     )
 
+def _safe_filename(name: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^\w\- ]+", "", name or "").strip().replace(" ", "_")
+    return cleaned or fallback
+
+
+def run_transcription():
+    """Full pipeline; everything the results section needs is stored in st.session_state.result."""
+    t0 = time.time()
+    log.info("Transcription lancée — instrument=%s, source=%s, stem=%s, onset=%.2f, min_note=%sms",
+             instrument_key, youtube_url or audio_name, stem_choice, onset_threshold, min_note_ms)
+    with st.spinner("Récupération de l'audio..."):
+        if youtube_url:
+            audio_path = get_audio_path(youtube_url, is_url=True)
+        else:
+            audio_path = get_audio_path(None, is_url=False, upload_bytes=audio_bytes, upload_name=audio_name)
+    log.info("Audio prêt : %s (%.1fs)", audio_path, time.time() - t0)
+
+    stem_path = audio_path
+    if STEM_CHOICES[stem_choice] is not None:
+        progress = st.progress(0.0, text="Séparation de sources (Demucs)... 1 à 3 min sur CPU pour un morceau entier.")
+
+        def _on_progress(info):
+            total = info.get("audio_length") or 1
+            done = info.get("segment_offset", 0)
+            progress.progress(min(done / total, 1.0), text="Séparation de sources (Demucs)...")
+
+        stem_path = isolate_stem(audio_path, stem_choice, progress_callback=_on_progress)
+        progress.progress(1.0, text="Séparation terminée.")
+        log.info("Séparation terminée : %s (%.1fs)", stem_path, time.time() - t0)
+
+    with st.spinner("Transcription en cours (Basic Pitch)... ça peut prendre 10-30s selon la durée."):
+        tr = transcribe_audio(
+            stem_path,
+            instrument=instrument_key,
+            onset_threshold=onset_threshold,
+            minimum_note_length=float(min_note_ms),
+            tempo_audio_path=audio_path,
+        )
+    log.info("Transcription terminée : %d notes, %.0f bpm (%.1fs)", len(tr.notes), tr.bpm, time.time() - t0)
+    if not tr.notes:
+        st.warning("Aucune note détectée. Essaie une autre piste à isoler, un enregistrement plus propre, ou baisse la sensibilité.")
+        return None
+
+    out_dir = tempfile.mkdtemp()
+    title = song_title or ("Transcription violon" if instrument_key == "Violin" else "Tablature guitare")
+    base = _safe_filename(song_title, "partition_violon" if instrument_key == "Violin" else "tab_guitare")
+
+    # Audio synthétisé de la transcription (pré-écoute + MIDI) : même ligne de temps que l'audio d'origine.
+    preview_midi = tr.to_pretty_midi(program=40 if instrument_key == "Violin" else 24)
+    preview_wave = preview_midi.synthesize(fs=22050)
+    preview_wave = preview_wave / (np.abs(preview_wave).max() or 1.0) * 0.8
+    preview_path = os.path.join(out_dir, "transcription.wav")
+    sf.write(preview_path, preview_wave.astype(np.float32), 22050, format="WAV", subtype="PCM_16")
+    midi_path = os.path.join(out_dir, base + ".mid")
+    preview_midi.write(midi_path)
+
+    result = {"tr": tr, "instrument": instrument_key, "title": title, "artist": song_artist, "base": base,
+              "midi_path": midi_path, "files": []}
+
+    with st.spinner("Génération de la partition..."):
+        score, detected_key = transcription_to_score(tr, title=title, artist=song_artist or None)
+        result["key"] = key_label(detected_key)
+        pdf_path, xml_path = export_pdf(score, os.path.join(out_dir, base + ".pdf"))
+        with open(xml_path, encoding="utf-8") as f:
+            result["musicxml"] = f.read()
+        log.info("Partition générée : %s (%.1fs)", pdf_path, time.time() - t0)
+
+    if instrument_key == "Violin":
+        result["files"] = [("📄 Partition (PDF)", pdf_path, base + ".pdf"),
+                           ("🎼 MusicXML (MuseScore)", xml_path, base + ".musicxml"),
+                           ("🎹 MIDI", midi_path, base + ".mid")]
+    else:
+        assignments = build_tab(tr)
+        ascii_tab = render_ascii_tab(assignments)
+        tab_pdf = os.path.join(out_dir, base + "_tab.pdf")
+        export_tab_pdf(ascii_tab, tab_pdf, title=title, subtitle=song_artist, credit=CREDIT,
+                       info=f"{tr.bpm:.0f} bpm — 4/4 — une colonne = une double-croche")
+        result["ascii_tab"] = ascii_tab
+        result["files"] = [("📄 Tablature (PDF)", tab_pdf, base + "_tab.pdf"),
+                           ("📄 Partition (PDF)", pdf_path, base + ".pdf"),
+                           ("🎼 MusicXML", xml_path, base + ".musicxml"),
+                           ("🎹 MIDI", midi_path, base + ".mid")]
+        log.info("Tablature générée : %s (%.1fs)", tab_pdf, time.time() - t0)
+
+    with st.spinner("Préparation de la lecture..."):
+        sources = {"Transcription": audio_data_uri(preview_path)}
+        if stem_path != audio_path:
+            sources["Piste isolée"] = audio_data_uri(stem_path)
+        sources["Original"] = audio_data_uri(audio_path)
+        result["viewer_html"] = build_viewer_html(
+            result["musicxml"], sources, bpm=tr.bpm, beat_origin=tr.beat_origin,
+            title=title, artist=song_artist, credit=CREDIT,
+        )
+    log.info("Terminé (%.1fs)", time.time() - t0)
+    return result
+
+
 if st.button("Transcrire", type="primary"):
     if not audio_bytes and not youtube_url:
         st.error("Ajoute un fichier audio ou un lien YouTube avant de lancer la transcription.")
         st.stop()
-
     try:
-        t0 = time.time()
-        log.info("Transcription lancée — instrument=%s, source=%s, stem=%s, onset=%.2f, min_note=%sms",
-                 instrument_key, youtube_url or audio_name, stem_choice, onset_threshold, min_note_ms)
-        with st.spinner("Récupération de l'audio..."):
-            if youtube_url:
-                audio_path = get_audio_path(youtube_url, is_url=True)
-            else:
-                audio_path = get_audio_path(None, is_url=False, upload_bytes=audio_bytes, upload_name=audio_name)
-
-        log.info("Audio prêt : %s (%.1fs)", audio_path, time.time() - t0)
-
-        stem_path = audio_path
-        if STEM_CHOICES[stem_choice] is not None:
-            progress = st.progress(0.0, text="Séparation de sources (Demucs)... 1 à 3 min sur CPU pour un morceau entier.")
-
-            def _on_progress(info):
-                total = info.get("audio_length") or 1
-                done = info.get("segment_offset", 0)
-                progress.progress(min(done / total, 1.0), text="Séparation de sources (Demucs)...")
-
-            stem_path = isolate_stem(audio_path, stem_choice, progress_callback=_on_progress)
-            progress.progress(1.0, text="Séparation terminée.")
-            log.info("Séparation terminée : %s (%.1fs)", stem_path, time.time() - t0)
-
-        with st.spinner("Transcription en cours (Basic Pitch)... ça peut prendre 10-30s selon la durée."):
-            tr = transcribe_audio(
-                stem_path,
-                instrument=instrument_key,
-                onset_threshold=onset_threshold,
-                minimum_note_length=float(min_note_ms),
-                tempo_audio_path=audio_path,
-            )
-
-        log.info("Transcription terminée : %d notes, %.0f bpm (%.1fs)", len(tr.notes), tr.bpm, time.time() - t0)
-
-        if not tr.notes:
-            st.warning("Aucune note détectée. Essaie une autre piste à isoler, un enregistrement plus propre, ou baisse la sensibilité.")
-            st.stop()
-
-        # Aperçu audio de la transcription : si ça ne ressemble pas au morceau ici, la partition sera fausse aussi.
-        st.subheader("Vérification à l'oreille")
-        preview_midi = tr.to_pretty_midi(program=40 if instrument_key == "Violin" else 24)
-        preview_wave = preview_midi.synthesize(fs=22050)
-        preview_wave = preview_wave / (np.abs(preview_wave).max() or 1.0) * 0.8
-        buf = io.BytesIO()
-        sf.write(buf, preview_wave.astype(np.float32), 22050, format="WAV")
-        st.audio(buf.getvalue(), format="audio/wav")
-        if stem_path != audio_path:
-            with st.expander("Écouter la piste isolée (ce que le modèle a vraiment transcrit)"):
-                with open(stem_path, "rb") as f:
-                    st.audio(f.read(), format="audio/wav")
-
-        out_dir = tempfile.mkdtemp()
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Tempo détecté", f"{tr.bpm:.0f} bpm")
-        col_c.metric("Notes", len(tr.notes))
-
-        if instrument_choice == "Violon":
-            with st.spinner("Génération de la partition..."):
-                score, detected_key = transcription_to_score(
-                    tr, title=song_title or "Transcription violon", artist=song_artist or None
-                )
-                col_b.metric("Tonalité", str(detected_key) if detected_key else "—")
-                pdf_path = os.path.join(out_dir, "partition_violon.pdf")
-                pdf_path, xml_path = export_pdf(score, pdf_path)
-
-            log.info("Partition générée : %s (%.1fs)", pdf_path, time.time() - t0)
-            st.success("Partition générée.")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                with open(pdf_path, "rb") as f:
-                    st.download_button("📄 Partition (PDF)", f, file_name="partition_violon.pdf")
-            with col2:
-                with open(xml_path, "rb") as f:
-                    st.download_button("🎼 MusicXML (MuseScore)", f, file_name="partition_violon.musicxml")
-            with col3:
-                midi_path = os.path.join(out_dir, "transcription.mid")
-                preview_midi.write(midi_path)
-                with open(midi_path, "rb") as f:
-                    st.download_button("🎹 MIDI", f, file_name="transcription.mid")
-
-        else:  # Guitare
-            with st.spinner("Génération de la tablature..."):
-                assignments = build_tab(tr)
-                ascii_tab = render_ascii_tab(assignments)
-                pdf_path = os.path.join(out_dir, "tab_guitare.pdf")
-                export_tab_pdf(
-                    ascii_tab, pdf_path,
-                    title=song_title or "Tablature guitare", subtitle=song_artist, credit=CREDIT,
-                    info=f"{tr.bpm:.0f} bpm — 4/4 — une colonne = une double-croche",
-                )
-                col_b.metric("Tonalité", "—")
-
-            log.info("Tablature générée : %s (%.1fs)", pdf_path, time.time() - t0)
-            st.success("Tablature générée.")
-            st.code(ascii_tab, language=None)
-            col1, col2 = st.columns(2)
-            with col1:
-                with open(pdf_path, "rb") as f:
-                    st.download_button("📄 Tablature (PDF)", f, file_name="tab_guitare.pdf")
-            with col2:
-                midi_path = os.path.join(out_dir, "transcription.mid")
-                preview_midi.write(midi_path)
-                with open(midi_path, "rb") as f:
-                    st.download_button("🎹 MIDI", f, file_name="transcription.mid")
-
+        st.session_state.result = run_transcription()
     except Exception as exc:  # MVP: on affiche l'erreur brute pour debug rapide
         log.exception("Échec de la transcription")
         st.error(f"Erreur pendant la transcription : {exc}")
         raise
+
+result = st.session_state.get("result")
+if result:
+    tr = result["tr"]
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Tempo détecté", f"{tr.bpm:.0f} bpm")
+    col_b.metric("Tonalité", result["key"])
+    col_c.metric("Notes", len(tr.notes))
+
+    # Vue interactive : partition + lecture avec curseur. Bascule Transcription / Original pour
+    # vérifier à l'oreille et à l'œil que ce qui est écrit correspond au morceau.
+    components.html(result["viewer_html"], height=720, scrolling=True)
+
+    cols = st.columns(len(result["files"]))
+    for col, (label, path, name) in zip(cols, result["files"]):
+        with open(path, "rb") as f:
+            col.download_button(label, f, file_name=name)
+
+    if result.get("ascii_tab"):
+        with st.expander("Tablature (texte)"):
+            st.code(result["ascii_tab"], language=None)
 
 st.divider()
 with st.expander("Limites connues de ce MVP"):
@@ -193,7 +207,8 @@ with st.expander("Limites connues de ce MVP"):
         - **Séparation de sources** (Demucs) : très efficace pour isoler voix / guitare / piano / basse. Le violon
           tombe dans la piste « Autres » avec tout ce qui n'est pas voix/basse/batterie — sur un morceau très chargé
           (synthés, cordes d'accompagnement), le résultat reste approximatif.
-        - **Rythme** : tempo constant détecté automatiquement, mesure à 4/4, quantification à la double-croche.
+        - **Rythme** : tempo constant détecté automatiquement, mesure à 4/4, écriture à la croche (double-croche
+          seulement si le morceau l'exige) ; les petits silences entre deux notes sont lus comme du legato.
           Les triolets, rubato et changements de tempo ne sont pas gérés. Le premier temps de la mesure 1 peut être décalé.
         - **Tablature guitare** : doigté choisi par heuristique simple (position la plus proche de la note précédente).
         - Pour corriger à la main : ouvre le MusicXML dans MuseScore (gratuit).

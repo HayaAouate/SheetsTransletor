@@ -9,6 +9,7 @@ import subprocess
 
 from music21 import clef, environment, instrument, key, metadata, meter, note, stream, tempo
 
+from .tools import ensure_tools_on_path, find_tool
 from .transcribe import Transcription
 
 CREDIT = "Violon d'or"  # printed top-right of every score, like a composer/arranger credit
@@ -18,14 +19,15 @@ _lilypond_bin = None
 def configure_lilypond(lilypond_path: str = None):
     """
     Point music21 at the Lilypond binary used to render PDFs. Call this once at app startup.
-    If lilypond_path is not given, resolves it from PATH automatically (works on Windows/macOS/Linux
-    as long as Lilypond's `bin` folder was added to PATH during install).
+    If lilypond_path is not given, looks in PATH and then in the usual install folders (winget,
+    Program Files...), and also puts FFmpeg on PATH the same way (see tools.py).
     """
-    resolved = lilypond_path or shutil.which("lilypond")
+    ensure_tools_on_path()
+    resolved = lilypond_path or find_tool("lilypond")
     if not resolved:
         raise RuntimeError(
-            "Lilypond introuvable dans le PATH. Installe-le depuis https://lilypond.org/download.html "
-            "et vérifie qu'il est bien ajouté au PATH (redémarre le terminal après installation)."
+            "Lilypond introuvable. Installe-le avec `winget install LilyPond.LilyPond` "
+            "(ou https://lilypond.org/download.html) puis relance l'application."
         )
     global _lilypond_bin
     _lilypond_bin = resolved
@@ -56,6 +58,7 @@ def transcription_to_score(tr: Transcription, title: str = None, artist: str = N
             pass
 
     part.makeRests(fillGaps=True, inPlace=True)
+    _split_rests(part)
     part.makeMeasures(inPlace=True)
 
     score = stream.Score()
@@ -63,6 +66,44 @@ def transcription_to_score(tr: Transcription, title: str = None, artist: str = N
         score.insert(0, metadata.Metadata(title=title or " ", alternativeTitle=artist or None))
     score.insert(0, part)
     return score, detected_key
+
+
+def _split_rests(part: stream.Part, beats_per_bar: int = 4):
+    """
+    makeRests fills each gap with a single rest of arbitrary length (3.5 beats -> a double-dotted
+    half rest). Musicians write rests beat by beat: whole bar, half on beats 1/3, quarters on beats,
+    eighths in between. Split every rest into such pieces, in place.
+    """
+    for r in list(part.getElementsByClass(note.Rest)):
+        pos, end = float(r.offset), float(r.offset + r.quarterLength)
+        pieces = []
+        while end - pos > 1e-6:
+            bar_pos, remaining = pos % beats_per_bar, end - pos
+            if bar_pos == 0 and remaining >= beats_per_bar:
+                d = beats_per_bar
+            elif bar_pos % 2 == 0 and remaining >= 2:
+                d = 2
+            elif bar_pos % 1 == 0 and remaining >= 1:
+                d = 1
+            elif bar_pos % 0.5 == 0 and remaining >= 0.5:
+                d = 0.5
+            else:
+                d = min(remaining, 0.25 - (bar_pos % 0.25) or 0.25)
+            pieces.append((pos, d))
+            pos += d
+        if len(pieces) > 1:
+            part.remove(r)
+            for off, d in pieces:
+                part.insert(off, note.Rest(quarterLength=d))
+
+
+def key_label(k) -> str:
+    """'e- minor' -> 'Mi♭ mineur', for the UI."""
+    if k is None:
+        return "—"
+    names = {"C": "Do", "D": "Ré", "E": "Mi", "F": "Fa", "G": "Sol", "A": "La", "B": "Si"}
+    tonic = names[k.tonic.step] + {"-": "♭", "#": "♯"}.get(k.tonic.accidental.modifier if k.tonic.accidental else "", "")
+    return f"{tonic} {'mineur' if k.mode == 'minor' else 'majeur'}"
 
 
 def _simplest_enharmonic_key(k: key.Key) -> key.Key:
