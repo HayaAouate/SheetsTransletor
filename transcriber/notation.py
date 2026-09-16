@@ -2,12 +2,14 @@
 (violin, flute, voice, etc). The Transcription is already monophonic and quantized on a beat grid
 (see transcribe.py), so this module only has to lay it out: tempo, key, measures, rests.
 """
+import gc
 import os
 import re
 import shutil
 import subprocess
+import time
 
-from music21 import clef, environment, instrument, key, metadata, meter, note, stream, tempo
+from music21 import clef, environment, instrument, key, metadata, meter, note, stream, tempo, tie
 
 from .tools import ensure_tools_on_path, find_tool
 from .transcribe import Transcription
@@ -45,7 +47,11 @@ def transcription_to_score(tr: Transcription, title: str = None, artist: str = N
     part.insert(0, tempo.MetronomeMark(number=int(round(tr.bpm))))
 
     for n in tr.notes:
-        part.insert(n.offset_beats, note.Note(n.pitch, quarterLength=n.duration_beats))
+        for offset, ql, is_last in _standard_pieces(n.offset_beats, n.duration_beats):
+            m21 = note.Note(n.pitch, quarterLength=ql)
+            if not is_last:
+                m21.tie = tie.Tie("start")
+            part.insert(offset, m21)
 
     detected_key = None
     if tr.notes:
@@ -66,6 +72,27 @@ def transcription_to_score(tr: Transcription, title: str = None, artist: str = N
         score.insert(0, metadata.Metadata(title=title or " ", alternativeTitle=artist or None))
     score.insert(0, part)
     return score, detected_key
+
+
+STANDARD_QL = (4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25)  # whole ... 16th, with single dots
+
+
+def _standard_pieces(offset: float, ql: float):
+    """
+    Split a duration into standard values tied together, so music21 never has to write a
+    double-dotted note or a 5-sixteenths duration: 1.25 beats -> quarter ~ sixteenth.
+    Yields (offset, quarterLength, is_last).
+    """
+    pieces = []
+    remaining = ql
+    while remaining > 1e-6:
+        d = next((v for v in STANDARD_QL if v <= remaining + 1e-6), STANDARD_QL[-1])
+        pieces.append(d)
+        remaining -= d
+    pos = offset
+    for i, d in enumerate(pieces):
+        yield pos, d, i == len(pieces) - 1
+        pos += d
 
 
 def _split_rests(part: stream.Part, beats_per_bar: int = 4):
@@ -175,13 +202,25 @@ def export_pdf(score: stream.Score, out_path: str, credit: str = CREDIT):
         f.write(ly)
 
     lilypond = _lilypond_bin or shutil.which("lilypond")
-    result = subprocess.run(
-        [lilypond, "--pdf", "-o", base_path, ly_path],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
     produced_path = base_path + ".pdf"
+    # Lilypond (Guile) needs a few hundred MB to start. Right after Demucs / CREPE the process is
+    # at its memory peak and the machine may be swapping: free what we can first, and if Lilypond
+    # dies without a word (no output, no PDF), give it a second chance after a pause.
+    gc.collect()
+    for attempt in range(2):
+        result = subprocess.run(
+            [lilypond, "--pdf", "-o", base_path, ly_path],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if os.path.exists(produced_path) or result.stderr.strip() or attempt:
+            break
+        time.sleep(3)
     if result.returncode != 0 or not os.path.exists(produced_path):
-        raise RuntimeError("Lilypond a échoué :\n" + result.stderr[-2000:])
+        raise RuntimeError(
+            f"Lilypond a échoué (code {result.returncode}, PDF attendu : {produced_path}, "
+            f"présent : {os.path.exists(produced_path)}, fichier .ly : {ly_path}).\n"
+            "stderr :\n" + (result.stderr[-2000:] or "(vide)") + "\nstdout :\n" + (result.stdout[-1000:] or "(vide)")
+        )
     if produced_path != out_path:
         os.replace(produced_path, out_path)
     return out_path, xml_path

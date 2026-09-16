@@ -7,3 +7,5 @@ pretty_midi>=0.2.9
 reportlab>=4.0
 soundfile>=0.12
 setuptools<81  # resampy (via basic-pitch) still imports pkg_resources, removed in setuptools 81
+torchcrepe>=0.0.24  # CREPE pitch tracking (melody.py) — PyTorch, already pulled in by demucs
+beat_this @ git+https://github.com/CPJKU/beat_this  # beat + downbeat tracking (beats.py); model (~77 MB) downloaded on first use

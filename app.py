@@ -60,6 +60,15 @@ stem_choice = st.selectbox(
 )
 
 with st.expander("Réglages avancés"):
+    method_label = st.radio(
+        "Détection des notes",
+        ["Suivi de mélodie (CREPE) — instrument à une voix", "Basic Pitch — polyphonique"],
+        index=0 if instrument_key == "Violin" else 1,
+        help="Le suivi de mélodie suit la hauteur de la ligne jouée (violon, flûte, voix) : traits rapides "
+        "et octaves justes, notes tenues d'un seul tenant. Basic Pitch détecte plusieurs notes à la fois "
+        "(guitare, accords) ; les deux réglages ci-dessous ne concernent que lui.",
+    )
+    method = "melody" if method_label.startswith("Suivi") else "basic_pitch"
     onset_threshold = st.slider(
         "Sensibilité de détection des notes",
         min_value=0.1, max_value=0.9, value=0.5, step=0.05,
@@ -79,7 +88,7 @@ def run_transcription():
     """Full pipeline; everything the results section needs is stored in st.session_state.result."""
     t0 = time.time()
     log.info("Transcription lancée — instrument=%s, source=%s, stem=%s, onset=%.2f, min_note=%sms",
-             instrument_key, youtube_url or audio_name, stem_choice, onset_threshold, min_note_ms)
+             instrument_key, youtube_url or audio_name, stem_choice, method, onset_threshold, min_note_ms)
     with st.spinner("Récupération de l'audio..."):
         if youtube_url:
             audio_path = get_audio_path(youtube_url, is_url=True)
@@ -100,13 +109,16 @@ def run_transcription():
         progress.progress(1.0, text="Séparation terminée.")
         log.info("Séparation terminée : %s (%.1fs)", stem_path, time.time() - t0)
 
-    with st.spinner("Transcription en cours (Basic Pitch)... ça peut prendre 10-30s selon la durée."):
+    label = ("Suivi de mélodie (CREPE) + temps (Beat This!)... environ 3x la durée du morceau."
+             if method == "melody" else "Transcription en cours (Basic Pitch)... ça peut prendre 10-30s selon la durée.")
+    with st.spinner(label):
         tr = transcribe_audio(
             stem_path,
             instrument=instrument_key,
             onset_threshold=onset_threshold,
             minimum_note_length=float(min_note_ms),
             tempo_audio_path=audio_path,
+            method=method,
         )
     log.info("Transcription terminée : %d notes, %.0f bpm (%.1fs)", len(tr.notes), tr.bpm, time.time() - t0)
     if not tr.notes:

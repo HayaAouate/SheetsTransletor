@@ -47,6 +47,10 @@ def download_audio_from_url(url: str) -> str:
         "quiet": False,
         "no_warnings": False,
         "noprogress": True,
+        # Un lien copié depuis YouTube traîne souvent `&list=...` (playlist / radio) : sans ceci
+        # yt-dlp télécharge les 100 morceaux de la playlist avant de rendre la main.
+        "noplaylist": True,
+        "playlist_items": "1",
     }
     log.info("Téléchargement audio : %s", url)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:

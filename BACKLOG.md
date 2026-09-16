@@ -25,7 +25,7 @@ Relevé sur le site + l'app (captures) :
 - [x] **M2** Armure correcte et orthographe des notes cohérente (bémols dans les tonalités en bémols…)
 - [x] **M3** Titre / artiste saisis dans l'app, crédit « Violon d'or » sur la partition
 - [x] **M4** **Affichage de la partition dans l'app + lecture avec curseur** (OpenSheetMusicDisplay + audio synthétisé), bascule *Transcription* / *Original* sur le même curseur, contrôle de vitesse
-- [x] **M5** Rythme lisible : fusion des micro-silences, pas de mesures vides en tête, choix binaire/ternaire des durées (l'écriture actuelle est trop hachée)
+- [x] **M5** Rythme lisible : fusion des micro-silences, pas de mesures vides en tête, durées standard — **sans jamais supprimer une note** (fidélité d'abord : grille croche quand la place est libre, double-croche sinon)
 - [x] **M6** Export MusicXML / MIDI / PDF depuis la vue (déjà là) + nom de fichier = titre du morceau
 
 ### Should (fort impact, faisable vite)
@@ -65,3 +65,35 @@ Chaque tâche = une livraison testable dans l'app. Je coche au fur et à mesure,
 11. [ ] **S4** Métronome + boucle A-B
 12. [ ] **S5** Transposition
 13. [ ] **S6** Enregistrement micro
+
+## Précision de la transcription — référence Songscription (16/09/2026)
+
+Référence : `samples/tiktok_lac0v.mp3` (On the Floor, cover violon @lac0v) et sa transcription Songscription
+`samples/tiktok_lac0v.songscription.json` (leur JSON `inscript/1`, lisible sans compte sur `/api/score/<base64>`).
+Comparaison mesure par mesure : `.venv/Scripts/python tools/compare_ref.py samples/tiktok_lac0v.mp3 melody`.
+
+Ce qu'on a appris en lisant leur front : pipeline en deux jobs (A2M audio→MIDI, puis M2S MIDI→partition),
+tracker de temps **et de premiers temps** (`/api/beats`, éditable), modèles par instrument, sortie ~97 % sur la
+grille croche, aucune nuance par note, un accord par mesure. Leur violon écrit la phrase grave **une octave
+au-dessus** de ce qui est joué (Basic Pitch et CREPE sont d'accord entre eux) : la comparaison ignore l'octave.
+
+Fait :
+- [x] **A2M mono** `melody.py` : CREPE (torchcrepe) + Viterbi maison en deux passes (a priori de registre) +
+      segmentation aux attaques, choix d'octave par continuité mélodique, fusion des fragments à attaque faible.
+      Réglage « Détection des notes » dans l'app (défaut violon). Basic Pitch reste pour la guitare / polyphonie.
+- [x] **Temps + premiers temps** `beats.py` : Beat This! sur le mix → grille par interpolation entre les temps
+      (dérive de tempo absorbée) + barres de mesure sur les downbeats ; repli librosa quand les attaques
+      tombent mieux sur sa grille (violon seul, rubato).
+- [x] **Rythme** : affectation des attaques à la grille croche par programmation dynamique (cases consécutives,
+      ordre conservé) ; une note jouée plus courte qu'une double garde sa position (croche pointée + double).
+- [x] Demucs déterministe (`shifts=0`) ; stem violon = `other + guitar` du modèle 6 pistes (le modèle range des
+      phrases de violon dans « guitar ») ; cache disque des probabilités CREPE.
+- Résultat : mesures 5–12 de la référence (la phrase grave, deux fois) **identiques** (hauteurs + rythme) ;
+  section aiguë : bonnes classes de hauteur, octave des `Bb` tirée vers le bas par la nappe synthé sur Sib3.
+
+À faire :
+- [ ] Octave des notes dont la nappe joue la même classe (Bb4/Bb5 à 21–36 s) : évidence harmonique (Basic Pitch
+      voit les deux) à combiner avec CREPE, ou modèle par instrument.
+- [ ] Curseur du lecteur sur l'audio d'origine via la carte des temps (`BeatMap`) plutôt qu'un bpm fixe.
+- [ ] CREPE « full » ≈ 3× la durée du morceau sur CPU : tester `tiny`, ou n'analyser que les zones voisées.
+- [ ] Intro : Songscription transcrit la pulsation synthé (mesures 1–4) ; nous non (le stem l'exclut). À décider.
