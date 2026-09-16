@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "streamlit",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": [
+        "/c",
+        "set PATH=%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-9.0.1-full_build\\bin;%LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\LilyPond.LilyPond_Microsoft.Winget.Source_8wekyb3d8bbwe\\lilypond-2.24.4\\bin;%PATH% && .venv\\Scripts\\streamlit run app.py --server.headless true --server.port 8501"
+      ],
+      "port": 8501
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+basic-pitch>=0.4.0
+demucs>=4.1.0
+music21>=9.0
+streamlit>=1.30
+yt-dlp>=2024.1.1
+pretty_midi>=0.2.9
+reportlab>=4.0
+soundfile>=0.12
+setuptools<81  # resampy (via basic-pitch) still imports pkg_resources, removed in setuptools 81

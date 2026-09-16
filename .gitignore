@@ -1,0 +1,65 @@
+# ─── Environnement virtuel ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Fichiers générés par l'app ───────────────────────────────────────────────
+output/
+
+# ─── Modèles Demucs (téléchargés automatiquement, ~80 Mo chacun) ──────────────
+# Stockés dans ~/.cache/torch/hub — pas dans le repo, mais au cas où
+*.th
+*.pt
+*.onnx
+
+# ─── Streamlit ────────────────────────────────────────────────────────────────
+.streamlit/
+
+# ─── Variables d'environnement / secrets ──────────────────────────────────────
+.env
+.env.*
+*.env
+
+# ─── Fichiers audio/MIDI temporaires ──────────────────────────────────────────
+*.mp3
+*.wav
+*.m4a
+*.mid
+*.midi
+*.ogg
+*.flac
+
+# ─── Fichiers de partition générés ────────────────────────────────────────────
+*.pdf
+*.xml
+*.musicxml
+*.ly
+*.png
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ─── Logs & caches divers ─────────────────────────────────────────────────────
+*.log
+.cache/
+*.tmp
