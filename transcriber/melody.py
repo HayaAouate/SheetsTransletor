@@ -71,7 +71,8 @@ def extract_melody(
 
     # 1. CREPE frame probabilities (T, 360) — the slow part (~3x real time on CPU), cached on disk
     #    so that re-transcribing the same audio with other settings is instant.
-    cache = os.path.join(tempfile.gettempdir(), "sheets_crepe", hashlib.sha1(y.tobytes()).hexdigest()[:16] + ".npy")
+    cache_dir = os.environ.get("SHEETS_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "sheets_crepe")
+    cache = os.path.join(cache_dir, hashlib.sha1(y.tobytes()).hexdigest()[:16] + ".npy")
     if os.path.exists(cache):
         probs = np.load(cache)
     else:
@@ -145,10 +146,10 @@ def extract_melody(
     # 4. Octave of each note from the melodic line, then re-join the fragments of one note.
     #    Attack strength (0..1) = peak of the onset envelope at the note start: a re-bowed note has
     #    a clear one, a fragment cut by a pitch wobble or a dropout has not.
-    notes = _drop_foreign_blips(notes, probs, midi_of_bin, midi_low, midi_high, register)
+    attacks = [float(np.clip(onset_env[max(0, fs - 2):fs + 3].max(), 0, 1)) for *_, fs, _fe in notes]
+    notes = _drop_foreign_notes(notes, attacks, probs, midi_of_bin, midi_low, midi_high, register)
     notes = _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, register=register, times=times)
-    notes = [(s, e, p, a, fs, fe, float(np.clip(onset_env[max(0, fs - 2):fs + 3].max(), 0, 1)))
-             for s, e, p, a, fs, fe in notes]
+    notes = [(s, e, p, a, fs, fe, attack) for (s, e, p, a, fs, fe, attack) in notes]
     notes = _merge_fragments(notes, onset_set)
     notes = [(s, e, p, a, attack) for s, e, p, a, _fs, _fe, attack in notes]
     log.info("CREPE : %d notes (%.0f%% de trames voisées)", len(notes), 100 * voiced.mean())
@@ -186,27 +187,43 @@ def _leap_cost(semitones: int, step_cost=0.12, leap_cost=0.45, easy=7) -> float:
     return step_cost * min(semitones, easy) + leap_cost * max(semitones - easy, 0)
 
 
-def _drop_foreign_blips(notes, probs, midi_of_bin, midi_low, midi_high, register, short_s=0.15, far=9, min_ratio=0.1):
+def _drop_foreign_notes(notes, attacks, probs, midi_of_bin, midi_low, midi_high, register, far=9, min_ratio=0.1,
+                        short_s=0.15, weak_attack=0.5, isolated=12):
     """
-    A fragment shorter than `short_s`, more than `far` semitones from the melody's register, whose
-    octave nearest the register has no CREPE evidence (< `min_ratio` of the fragment's own mass) is
-    not an octave error of the melody: it is the accompaniment heard in a gap. Dropped, because
-    left in it would anchor the octave choice of the notes around it (see _fix_octaves).
+    The accompaniment heard in a gap of the melody. A note is judged by the octave CREPE finds
+    most likely (the register prior of the second pass may have moved it): when that octave is
+    more than `far` semitones from the melody's register and the octave on the register's side
+    has no evidence (< `min_ratio` of the note's own mass) — so not an octave error of the line —
+    the note is dropped if it is short (< `short_s`), or has no real attack (< `weak_attack`: a
+    chord tone sustained under a rest), or sits `isolated` semitones or more below the line with
+    both neighbours in the register (a plucked bass note: a violin does not dive an octave and a
+    half for one note). Left in, such a note anchors the octave choice of the notes around it
+    (see _fix_octaves). Returns 7-tuples: the notes with their attack strength.
     """
+    out = [(s, e, p, a, fs, fe, att) for (s, e, p, a, fs, fe), att in zip(notes, attacks)]
     if register is None or len(notes) < 3:
-        return notes
+        return out
+
+    def mass(fs, fe, midi):
+        return float(probs[fs:fe][:, np.abs(midi_of_bin - midi) <= 0.5].sum(axis=1).mean())
+
+    def reg_at(fs):
+        return float(register[min(fs, len(register) - 1)])
+
     kept = []
-    for n in notes:
-        s, e, p, _a, fs, fe = n
-        reg = float(register[min(fs, len(register) - 1)])
-        if e - s < short_s and abs(p - reg) > far:
-            alt = p + 12 if p < reg else p - 12
-            if not (midi_low <= alt <= midi_high):
-                continue
-            own = probs[fs:fe][:, np.abs(midi_of_bin - p) <= 0.5].sum(axis=1).mean()
-            other = probs[fs:fe][:, np.abs(midi_of_bin - alt) <= 0.5].sum(axis=1).mean()
-            if other < min_ratio * max(own, 1e-9):
-                continue
+    for i, n in enumerate(out):
+        s, e, p, _a, fs, fe, att = n
+        reg = reg_at(fs)
+        octaves = {q: mass(fs, fe, q) for q in (p - 12, p, p + 12) if midi_low <= q <= midi_high}
+        best = max(octaves, key=octaves.get)
+        if abs(best - reg) > far:
+            toward = best + 12 if best < reg else best - 12
+            evidence = octaves.get(toward, 0.0) >= min_ratio * max(octaves[best], 1e-9)
+            if not evidence:
+                prev_ok = i == 0 or abs(out[i - 1][2] - reg_at(out[i - 1][4])) <= far
+                next_ok = i == len(out) - 1 or abs(out[i + 1][2] - reg_at(out[i + 1][4])) <= far
+                if e - s < short_s or att < weak_attack or (reg - best >= isolated and prev_ok and next_ok):
+                    continue
         kept.append(n)
     return kept
 
@@ -236,7 +253,7 @@ def _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, register=None, 
         return float(probs[start:end][:, sel[midi]].sum(axis=1).mean())
 
     cands, weights = [], []
-    for s, e, p, _a, fs, fe in notes:
+    for s, e, p, _a, fs, fe, *_ in notes:
         opts = {}
         for q in (p - 12, p, p + 12):
             if midi_low <= q <= midi_high:
@@ -272,7 +289,7 @@ def _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, register=None, 
         q = back[i][q]
         chosen.append(q)
     chosen.reverse()
-    return [(s, e, q, a, fs, fe) for (s, e, _p, a, fs, fe), q in zip(notes, chosen)]
+    return [(s, e, q, a, fs, fe, *rest) for (s, e, _p, a, fs, fe, *rest), q in zip(notes, chosen)]
 
 
 def _merge_fragments(notes, onset_set, max_gap_s=0.15, weak_attack=0.6, blip_s=0.1):
