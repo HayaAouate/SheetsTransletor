@@ -53,18 +53,33 @@ class Transcription:
     bpm: float = 120.0
     beat_origin: float = 0.0  # seconds; time of the first written beat (measure 1, beat 1)
     instrument: str = "Violin"
+    # Seconds of every written beat (index k = beat k of the score, measure 1 beat 1 = 0), from the
+    # tracked beats when available: the score's timeline on the original recording, tempo drift
+    # included. None -> constant tempo (beat_origin + k * 60 / bpm).
+    beat_times: list = None
 
     @property
     def beat_seconds(self) -> float:
         return 60.0 / self.bpm
 
+    def seconds_at(self, beats: float) -> float:
+        """Time in the original recording of a position in the score, in beats."""
+        if not self.beat_times:
+            return self.beat_origin + beats * self.beat_seconds
+        bt = np.asarray(self.beat_times)
+        if beats <= 0:
+            return float(bt[0] + beats * (bt[1] - bt[0]))
+        if beats >= len(bt) - 1:
+            return float(bt[-1] + (beats - (len(bt) - 1)) * (bt[-1] - bt[-2]))
+        return float(np.interp(beats, np.arange(len(bt)), bt))
+
     def to_pretty_midi(self, program: int = 40) -> pretty_midi.PrettyMIDI:
-        """Cleaned notes re-aligned on the grid, as MIDI (used for the audio preview / MIDI download)."""
+        """Cleaned notes on the recording's timeline, as MIDI (audio preview / MIDI download)."""
         pm = pretty_midi.PrettyMIDI(initial_tempo=self.bpm)
         inst = pretty_midi.Instrument(program=program)
         for n in self.notes:
-            start = max(0.0, self.beat_origin + n.offset_beats * self.beat_seconds)
-            end = start + n.duration_beats * self.beat_seconds  # pretty_midi cannot synthesize t < 0
+            start = max(0.0, self.seconds_at(n.offset_beats))
+            end = max(start + 0.05, self.seconds_at(n.offset_beats + n.duration_beats))  # no t < 0
             velocity = int(np.clip(40 + 87 * n.amplitude, 40, 127))
             inst.notes.append(pretty_midi.Note(velocity=velocity, pitch=n.pitch, start=start, end=end))
         pm.instruments.append(inst)
@@ -101,6 +116,13 @@ def transcribe_audio(
     else:
         notes = _basic_pitch_notes(audio_path, low, high, onset_threshold, frame_threshold, minimum_note_length)
     log.info("Après filtrage accompagnement / fantômes : %d notes", len(notes))
+    # Same-pitch notes cut by the tracker: when is the cut a real re-attack? Basic Pitch's onset
+    # activation is a reliable witness (>= 0.7 = re-attacked). CREPE notes carry the stem's onset
+    # envelope instead, which vibrato drives up to 1.0 on a held note: there only a deep energy
+    # dip (< 0.3 of the level, measured on both a clean take and a cover over a backing track)
+    # with some attack behind it (>= 0.4) counts.
+    merge_settings = ({"clear_onset": 1.01, "dip_ratio": 0.3, "weak_onset": 0.4, "strong_onset": 0.85} if method == "melody"
+                      else {"clear_onset": 0.7, "dip_ratio": 0.4})
 
     # Beat grid. Preferred: Beat This! on the mix -> beat map (robust to tempo drift) + downbeats
     # (bar lines). Fallback: librosa tempo + phase, refined on the note onsets, bar lines guessed
@@ -118,29 +140,37 @@ def transcribe_audio(
             beat_map = BeatMap(_resample_beats(beat_times, tracked_bpm / beat_map.bpm))
         tracked_cost = _grid_cost(notes, beat_map.to_beats)
         fallback_cost = _grid_cost(notes, lambda t: (t - beat_origin) * bpm / 60.0)
-        log.info("Grille : Beat This! %.1f bpm (coût %.2f) vs librosa %.1f bpm (coût %.2f)",
-                 tracked_bpm, tracked_cost, bpm, fallback_cost)
-        if tracked_cost > 1.15 * fallback_cost:
+        ratio = tracked_bpm / bpm
+        same_pulse = any(abs(ratio - r) / r < 0.04 for r in (0.5, 1.0, 2.0))
+        log.info("Grille : Beat This! %.1f bpm (coût %.2f) vs librosa %.1f bpm (coût %.2f)%s",
+                 tracked_bpm, tracked_cost, bpm, fallback_cost, ", même pulsation" if same_pulse else "")
+        # Same pulse (possibly halved / doubled): both heard the same beat, and only Beat This!
+        # knows where the bars start. A different pulse: trust whichever the onsets sit on.
+        if not same_pulse and tracked_cost > 1.15 * fallback_cost:
             beat_times = None
     if beat_times is not None:
         bpm = tracked_bpm
         mono = _clean_and_quantize(notes, beat_map.to_beats)
-        mono = _merge_false_splits(mono, audio_path)
+        mono = _merge_false_splits(mono, audio_path, **merge_settings)
         mono = _drop_leading_bleed(mono)
         first_downbeat = int(round(beat_map.to_beats(downbeat_times[0]))) * SLOTS_PER_BEAT
         shift = _align_to_downbeats(mono, first_downbeat)
         beat_origin = beat_map.to_seconds(-shift * GRID)  # slot 0 after the shift, in seconds
+        # Score beat k sits at original beat k - shift*GRID: the score's timeline, beat by beat.
+        last_beat = max((n.slot + n.length for n in mono), default=0) * GRID + 8
+        beat_times = [beat_map.to_seconds(k - shift * GRID) for k in range(int(last_beat) + 1)]
         log.info("Tempo : %.1f bpm (Beat This!), mesure 1 à %.2fs", bpm, beat_origin)
     else:
         log.info("Tempo : %.1f bpm (librosa), origine=%.3fs", bpm, beat_origin)
         mono = _clean_and_quantize(notes, lambda t: (t - beat_origin) * bpm / 60.0)
-        mono = _merge_false_splits(mono, audio_path)
+        mono = _merge_false_splits(mono, audio_path, **merge_settings)
         mono = _drop_leading_bleed(mono)
         shift = _align_downbeat(mono)
         beat_origin -= shift * (60.0 / bpm * GRID)  # slots moved by +shift -> origin moves by -shift
+        beat_times = None
     mono = _simplify_rhythm(mono, grid_sec=60.0 / bpm * GRID)
     log.info("Rythme : %d notes écrites (%d sur la grille croche)", len(mono), sum(1 for n in mono if n.slot % 2 == 0))
-    return Transcription(notes=mono, bpm=bpm, beat_origin=beat_origin, instrument=instrument)
+    return Transcription(notes=mono, bpm=bpm, beat_origin=beat_origin, instrument=instrument, beat_times=beat_times)
 
 
 def _grid_cost(notes, to_beats) -> float:
@@ -253,8 +283,8 @@ def _readable_tempo(bpm: float, notes) -> float:
     Beat trackers sometimes lock on half or double the felt tempo. For notation the difference is
     huge: at half tempo every eighth note is written as a sixteenth. Only the extreme cases are
     corrected, from the spacing between note onsets (not their sounded length, which depends on
-    how the note decays): a melody whose typical note-to-note spacing is a sixteenth or less is
-    written at double tempo, one whose notes are two beats apart or more at half tempo.
+    how the note decays): a melody where a good share of the note-to-note spacings are a sixteenth
+    or less is written at double tempo, one where they are two beats or more at half tempo.
     """
     if len(notes) < 8:
         return bpm
@@ -263,10 +293,12 @@ def _readable_tempo(bpm: float, notes) -> float:
     ioi = ioi[ioi > 0.03]  # ignore near-simultaneous detections (octave ghosts)
     if len(ioi) < 6:
         return bpm
-    beats = float(np.median(ioi)) * bpm / 60.0
-    if beats < 0.35 and bpm * 2 <= 200:
+    beats = ioi * bpm / 60.0
+    # More than 30 % of the notes would be sixteenths (or shorter) at this tempo: write it twice
+    # as fast, they become eighths. Symmetrically, more than 30 % longer than two beats: halve.
+    if float(np.percentile(beats, 30)) < 0.35 and bpm * 2 <= 200:
         return bpm * 2
-    if beats > 1.75 and bpm / 2 >= 55:
+    if float(np.percentile(beats, 70)) > 1.75 and bpm / 2 >= 55:
         return bpm / 2
     return bpm
 
@@ -341,30 +373,33 @@ def _assign_to_grid(slots, unit: int, max_move: int, short=None):
     if not slots:
         return []
     short = short or [False] * len(slots)
-    span = max_move + unit  # candidate cells around each onset
-    cands = [sorted({(s + d) // unit * unit for d in range(-span, span + 1)} | {_snap(s, unit)} | ({s} if sh else set()))
-             for s, sh in zip(slots, short)]
-    INF = float("inf")
+    span = max_move + unit
+    # Candidates: the coarse cells around the onset, plus the onset's own fine slot. The fine slot
+    # always being a candidate (the fine slots are distinct and increasing), a valid path always
+    # exists — a dense run of sixteenths simply stays on the fine grid.
+    cands = [sorted({(s + d) // unit * unit for d in range(-span, span + 1)} | {_snap(s, unit), s})
+             for s in slots]
 
     def move_cost(i, c):
-        return 0.5 if (short[i] and c == slots[i] and c % unit) else abs(c - slots[i])
+        if c == slots[i] and c % unit:  # staying off the coarse grid
+            return 0.5 if short[i] else max_move + 0.5
+        return abs(c - slots[i])
 
     best = [{c: (move_cost(0, c), None) for c in cands[0]}]
     for i in range(1, len(slots)):
         cur = {}
         for c in cands[i]:
             prev = [(cost, pc) for pc, (cost, _) in best[-1].items() if pc < c]
-            if not prev:
-                continue
-            cost, pc = min(prev)
-            cur[c] = (cost + move_cost(i, c), pc)
-        best.append(cur if cur else {max(cands[i]): (INF, None)})
+            if prev:
+                cost, pc = min(prev)
+                cur[c] = (cost + move_cost(i, c), pc)
+        best.append(cur)
     # backtrack
     c = min(best[-1], key=lambda k: best[-1][k][0])
     coarse = [c]
     for i in range(len(slots) - 1, 0, -1):
         c = best[i][c][1]
-        coarse.append(c if c is not None else slots[i - 1])
+        coarse.append(c)
     coarse.reverse()
 
     # A note pushed too far does not fit the coarse grid: this stretch is a genuine fast run,
@@ -383,7 +418,8 @@ def _assign_to_grid(slots, unit: int, max_move: int, short=None):
 NICE_LENGTHS = (1, 2, 3, 4, 6, 8, 12, 16)  # in 16th slots: 16th, 8th, dotted 8th, quarter, ... whole
 
 
-def _merge_false_splits(mono, audio_path: str, dip_ratio: float = 0.4, clear_onset: float = 0.7):
+def _merge_false_splits(mono, audio_path: str, dip_ratio: float = 0.4, clear_onset: float = 0.7, weak_onset: float = 0.0,
+                        strong_onset: float = 2.0):
     """
     Basic Pitch cuts a sustained note in two whenever its onset detector fires above 0.5, which
     vibrato, a change of bow pressure or drum bleed do all the time: a held note comes out as a run
@@ -411,7 +447,11 @@ def _merge_false_splits(mono, audio_path: str, dip_ratio: float = 0.4, clear_ons
         if prev.pitch == n.pitch and prev.slot + prev.length == n.slot and n.onset < clear_onset:
             dip = rms_between(n.start - 0.08, n.start + 0.02, np.min)
             level = rms_between(n.start, n.start + 0.12, np.max)
-            if dip >= dip_ratio * level:  # nothing re-attacked: same note still ringing
+            # Nothing re-attacked (same note still ringing): no deep dip, or a dip with no attack
+            # at all behind it (`weak_onset`: a drum hit in the stem's residue makes dips too).
+            # An attack as sharp as the sharpest in the piece (>= `strong_onset`) is a bow stroke
+            # even without a dip: legato repeated notes have no gap between them.
+            if (dip >= dip_ratio * level or n.onset < weak_onset) and n.onset < strong_onset:
                 prev.length += n.length
                 prev.end = n.end
                 prev.amplitude = max(prev.amplitude, n.amplitude)

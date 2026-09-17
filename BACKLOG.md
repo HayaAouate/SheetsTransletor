@@ -94,6 +94,7 @@ Fait :
 À faire :
 - [ ] Octave des notes dont la nappe joue la même classe (Bb4/Bb5 à 21–36 s) : évidence harmonique (Basic Pitch
       voit les deux) à combiner avec CREPE, ou modèle par instrument.
-- [ ] Curseur du lecteur sur l'audio d'origine via la carte des temps (`BeatMap`) plutôt qu'un bpm fixe.
+- [x] Curseur du lecteur et aperçu synthétisé sur la carte des temps (`Transcription.beat_times`) : sur un
+      cover de 61 s, écart curseur/audio médian 225 ms → 30 ms, plus de dérive (+372 ms en fin de morceau avant).
 - [ ] CREPE « full » ≈ 3× la durée du morceau sur CPU : tester `tiny`, ou n'analyser que les zones voisées.
 - [ ] Intro : Songscription transcrit la pulsation synthé (mesures 1–4) ; nous non (le stem l'exclut). À décider.

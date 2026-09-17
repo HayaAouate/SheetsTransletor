@@ -47,6 +47,7 @@ def build_viewer_html(
     title: str = "",
     artist: str = "",
     credit: str = "",
+    beat_times: list = None,
 ) -> str:
     """
     Build the self-contained HTML for the viewer.
@@ -54,12 +55,15 @@ def build_viewer_html(
     musicxml: the score as a MusicXML string.
     sources: {"label": data_uri} audio sources, in display order (first one selected).
     bpm / beat_origin: from the Transcription; time(s) = beat_origin + whole_notes * 4 * 60 / bpm.
+    beat_times: seconds of each written beat (Transcription.beat_times); when given, the cursor
+                follows this timeline (tempo drift included) instead of the constant tempo.
     """
     config = {
         "musicxml": musicxml,
         "sources": sources,
         "secondsPerWhole": 4 * 60.0 / bpm,
         "beatOrigin": beat_origin,
+        "beatTimes": list(map(float, beat_times)) if beat_times else None,
         "title": title,
         "artist": artist,
         "credit": credit,
@@ -80,6 +84,8 @@ _TEMPLATE = r"""
   #toolbar button { border: 0; border-radius: 6px; padding: 6px 14px; font-size: 14px; cursor: pointer; }
   #play { background: #0d8f7f; color: #fff; font-weight: 600; min-width: 84px; }
   #stop { background: #eee; }
+  #full { background: #eee; margin-left: auto; }
+  :fullscreen body, body:fullscreen { overflow: auto; }
   .seg { display: inline-flex; border: 1px solid #ccc; border-radius: 6px; overflow: hidden; }
   .seg button { border-radius: 0; background: #fff; }
   .seg button.on { background: #0d8f7f; color: #fff; }
@@ -90,16 +96,20 @@ _TEMPLATE = r"""
   #header .artist { color: #444; margin-top: 2px; }
   #header .credit { position: absolute; right: 16px; top: 16px; color: #444; font-size: 13px; }
   #score { padding: 0 8px 24px; cursor: pointer; }
+  /* OSMD puts its cursor at z-index -1 (behind the notes, above a transparent background); keep it
+     above whatever is drawn, the notes stay readable through its 50 % alpha. */
+  #score img[id^="cursorImg"] { z-index: 1 !important; }
   #status { padding: 12px; color: #888; font-size: 13px; }
 </style>
 </head>
-<body>
+<body tabindex="0">
 <div id="toolbar">
-  <button id="play">▶ Lecture</button>
+  <button id="play" title="Lecture / pause (barre d'espace)">▶ Lecture</button>
   <button id="stop">■</button>
   <span id="time">0:00 / 0:00</span>
   <span class="seg" id="sources"></span>
   <label>Vitesse <input id="speed" type="range" min="0.5" max="1.5" step="0.05" value="1" style="width:110px"> <span id="speedv">1.00×</span></label>
+  <button id="full" title="Afficher la partition en plein écran (Échap pour revenir)">⛶ Plein écran</button>
 </div>
 <div id="header"></div>
 <div id="score"></div>
@@ -145,7 +155,13 @@ const speed = document.getElementById("speed");
 speed.oninput = () => { audio.playbackRate = parseFloat(speed.value); document.getElementById("speedv").textContent = parseFloat(speed.value).toFixed(2) + "×"; };
 audio.preservesPitch = true;
 
-playBtn.onclick = () => { if (audio.paused) audio.play(); else audio.pause(); };
+function togglePlay() { if (audio.paused) audio.play(); else audio.pause(); }
+playBtn.onclick = togglePlay;
+// Space bar = play / pause (the page must have the keyboard focus: any click on it gives it).
+document.addEventListener("keydown", ev => {
+  if (ev.code === "Space" && !/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)) { ev.preventDefault(); togglePlay(); }
+});
+document.addEventListener("mousedown", () => { if (document.activeElement && document.activeElement.tagName === "INPUT") document.activeElement.blur(); });
 document.getElementById("stop").onclick = () => { audio.pause(); audio.currentTime = 0; syncCursor(true); };
 let timer = null;  // setInterval rather than requestAnimationFrame: keeps running in a hidden tab/iframe
 audio.onplay = () => { playBtn.textContent = "❚❚ Pause"; clearInterval(timer); timer = setInterval(tick, 40); };
@@ -154,11 +170,43 @@ audio.onended = () => { playBtn.textContent = "▶ Lecture"; clearInterval(timer
 
 function fmt(t) { t = Math.max(0, t || 0); return Math.floor(t / 60) + ":" + String(Math.floor(t % 60)).padStart(2, "0"); }
 
+// ---- full screen: the iframe itself when the browser allows it, else the same page in a new tab
+// (the page is self-contained, audio included) where F11 gives the full screen.
+const fullBtn = document.getElementById("full");
+fullBtn.onclick = async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+  } catch (e) {  // the host page does not allow it: same viewer in its own tab (F11 there)
+    const blob = new Blob(["<!doctype html>" + document.documentElement.outerHTML], {type: "text/html"});
+    const url = URL.createObjectURL(blob);
+    if (!window.open(url, "_blank")) {  // pop-up blocked: give a plain link to click instead
+      const a = document.createElement("a");
+      a.href = url; a.target = "_blank"; a.textContent = "↗ Ouvrir dans un onglet";
+      a.style.cssText = "margin-left:auto;font-size:14px;color:#0d8f7f;font-weight:600";
+      fullBtn.replaceWith(a);
+    }
+  }
+};
+
 // ---- score ----
+// A4 page layout, like the PDF: same system breaks and margins, scaled to the available width.
 const osmd = new opensheetmusicdisplay.OpenSheetMusicDisplay("score", {
-  autoResize: true, drawTitle: false, drawSubtitle: false, drawComposer: false, drawLyricist: false,
+  autoResize: true, pageFormat: "A4_P",
+  drawTitle: false, drawSubtitle: false, drawComposer: false, drawLyricist: false,
   drawPartNames: false, followCursor: true, cursorsOptions: [{type: 0, color: "#0d8f7f", alpha: 0.5, follow: true}],
 });
+// Score position (whole notes) -> seconds in the recording: along the tracked beats when we
+// have them (piecewise linear, extrapolated at both ends), else at the constant tempo.
+function secondsAt(wholeNotes) {
+  const bt = CFG.beatTimes;
+  if (!bt || bt.length < 2) return CFG.beatOrigin + wholeNotes * CFG.secondsPerWhole;
+  const b = wholeNotes * 4;
+  if (b <= 0) return bt[0] + b * (bt[1] - bt[0]);
+  const n = bt.length - 1;
+  if (b >= n) return bt[n] + (b - n) * (bt[n] - bt[n - 1]);
+  const i = Math.floor(b);
+  return bt[i] + (b - i) * (bt[i + 1] - bt[i]);
+}
 let cursorTimes = [];   // seconds at which each cursor position starts
 let cursorIndex = 0;
 let measureTimes = [];  // seconds at which each measure starts
@@ -170,12 +218,12 @@ osmd.load(CFG.musicxml).then(() => {
   osmd.cursor.reset();
   const it = osmd.cursor.iterator;
   while (!it.EndReached) {
-    cursorTimes.push(CFG.beatOrigin + it.currentTimeStamp.RealValue * CFG.secondsPerWhole);
+    cursorTimes.push(secondsAt(it.currentTimeStamp.RealValue));
     osmd.cursor.next();
   }
   osmd.cursor.reset();
   cursorIndex = 0;
-  measureTimes = osmd.Sheet.SourceMeasures.map(m => CFG.beatOrigin + m.AbsoluteTimestamp.RealValue * CFG.secondsPerWhole);
+  measureTimes = osmd.Sheet.SourceMeasures.map(m => secondsAt(m.AbsoluteTimestamp.RealValue));
   status.textContent = "";
   timeEl.textContent = fmt(0) + " / " + fmt(audio.duration);
 }).catch(e => { status.textContent = "Impossible d'afficher la partition : " + e; });

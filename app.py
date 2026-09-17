@@ -127,7 +127,9 @@ def run_transcription():
 
     out_dir = tempfile.mkdtemp()
     title = song_title or ("Transcription violon" if instrument_key == "Violin" else "Tablature guitare")
-    base = _safe_filename(song_title, "partition_violon" if instrument_key == "Violin" else "tab_guitare")
+    # File names = "Titre - Artiste" as typed (sanitised), else a generic name.
+    base = _safe_filename(" - ".join(x for x in (song_title, song_artist) if x),
+                          "partition_violon" if instrument_key == "Violin" else "tab_guitare")
 
     # Audio synthétisé de la transcription (pré-écoute + MIDI) : même ligne de temps que l'audio d'origine.
     preview_midi = tr.to_pretty_midi(program=40 if instrument_key == "Violin" else 24)
@@ -139,7 +141,7 @@ def run_transcription():
     preview_midi.write(midi_path)
 
     result = {"tr": tr, "instrument": instrument_key, "title": title, "artist": song_artist, "base": base,
-              "midi_path": midi_path, "files": []}
+              "midi_path": midi_path, "files": [], "source": youtube_url or audio_name}
 
     with st.spinner("Génération de la partition..."):
         score, detected_key = transcription_to_score(tr, title=title, artist=song_artist or None)
@@ -171,10 +173,7 @@ def run_transcription():
         if stem_path != audio_path:
             sources["Piste isolée"] = audio_data_uri(stem_path)
         sources["Original"] = audio_data_uri(audio_path)
-        result["viewer_html"] = build_viewer_html(
-            result["musicxml"], sources, bpm=tr.bpm, beat_origin=tr.beat_origin,
-            title=title, artist=song_artist, credit=CREDIT,
-        )
+        result["sources"] = sources  # the viewer itself is rebuilt at display time (see below)
     log.info("Terminé (%.1fs)", time.time() - t0)
     return result
 
@@ -183,6 +182,9 @@ if st.button("Transcrire", type="primary"):
     if not audio_bytes and not youtube_url:
         st.error("Ajoute un fichier audio ou un lien YouTube avant de lancer la transcription.")
         st.stop()
+    # Forget the previous score first: if this run fails, the old one must not stay on screen and
+    # pass for the transcription of the new source.
+    st.session_state.result = None
     try:
         st.session_state.result = run_transcription()
     except Exception as exc:  # MVP: on affiche l'erreur brute pour debug rapide
@@ -193,14 +195,20 @@ if st.button("Transcrire", type="primary"):
 result = st.session_state.get("result")
 if result:
     tr = result["tr"]
+    st.caption(f"Source transcrite : {result.get('source') or '—'}")
     col_a, col_b, col_c = st.columns(3)
     col_a.metric("Tempo détecté", f"{tr.bpm:.0f} bpm")
     col_b.metric("Tonalité", result["key"])
     col_c.metric("Notes", len(tr.notes))
 
     # Vue interactive : partition + lecture avec curseur. Bascule Transcription / Original pour
-    # vérifier à l'oreille et à l'œil que ce qui est écrit correspond au morceau.
-    components.html(result["viewer_html"], height=720, scrolling=True)
+    # vérifier à l'oreille et à l'œil que ce qui est écrit correspond au morceau. Rebuilt on every
+    # rerun (cheap: the audio is already encoded) so that a change to the viewer applies on reload.
+    viewer_html = build_viewer_html(
+        result["musicxml"], result["sources"], bpm=tr.bpm, beat_origin=tr.beat_origin, beat_times=tr.beat_times,
+        title=result["title"], artist=result["artist"], credit=CREDIT,
+    )
+    components.html(viewer_html, height=760, scrolling=True)
 
     cols = st.columns(len(result["files"]))
     for col, (label, path, name) in zip(cols, result["files"]):

@@ -43,12 +43,22 @@ def transcription_to_score(tr: Transcription, title: str = None, artist: str = N
     part = stream.Part()
     part.insert(0, instrument.Violin() if tr.instrument == "Violin" else instrument.Guitar())
     part.insert(0, clef.TrebleClef())
-    part.insert(0, meter.TimeSignature("4/4"))
+    ts = meter.TimeSignature("4/4")
+    # Beam eighths by half-bar (4 per group, as Lilypond does by default) rather than music21's
+    # per-beat pairs; the nested level keeps the secondary beams of sixteenths broken per beat.
+    ts.beamSequence.partition(2)
+    ts.beamSequence.subdividePartitionsEqual(2)
+    part.insert(0, ts)
     part.insert(0, tempo.MetronomeMark(number=int(round(tr.bpm))))
 
     for n in tr.notes:
         for offset, ql, is_last in _standard_pieces(n.offset_beats, n.duration_beats):
             m21 = note.Note(n.pitch, quarterLength=ql)
+            if m21.pitch.accidental is not None and m21.pitch.accidental.alter == 0:
+                # A pitch built from a MIDI number carries an explicit natural, which the MusicXML
+                # export then prints on every white key. Drop it: the notation adds a natural sign
+                # itself where one is needed (after the key signature's flat, after an accidental).
+                m21.pitch.accidental = None
             if not is_last:
                 m21.tie = tie.Tie("start")
             part.insert(offset, m21)
@@ -66,6 +76,11 @@ def transcription_to_score(tr: Transcription, title: str = None, artist: str = N
     part.makeRests(fillGaps=True, inPlace=True)
     _split_rests(part)
     part.makeMeasures(inPlace=True)
+    # A note held up to the next attack can cross a bar line: split it there into tied notes, so
+    # that every measure holds exactly its 4 beats. Left as is, the measure overflows and the
+    # score viewer (which places measure n+1 one whole note after measure n) drifts ahead of the
+    # audio by the overflow, cumulatively.
+    part.makeTies(inPlace=True)
 
     score = stream.Score()
     if title or artist:

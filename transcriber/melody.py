@@ -43,6 +43,7 @@ def extract_melody(
     midi_high: int = 100,
     min_note_ms: float = 60.0,
     voicing: float = 0.35,
+    sure: float = 0.7,
     jump_penalty: float = 8.0,
     register_weight: float = 0.4,
 ):
@@ -52,7 +53,8 @@ def extract_melody(
 
     midi_low/high: playable range of the instrument; bins outside are never chosen.
     min_note_ms:   shorter pitch segments are merged into their neighbour (vibrato / transitions).
-    voicing:       CREPE confidence below which a frame is a rest.
+    voicing:       CREPE confidence below which a frame is a rest; between `voicing` and `sure`
+                   the frame also needs energy above the stem's noise floor.
     jump_penalty:  Viterbi cost (in log-prob units) of moving to a non-adjacent bin.
     register_weight: per-frame cost, per semitone beyond a fifth from the local register (2nd pass).
     """
@@ -88,12 +90,17 @@ def extract_melody(
     rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=HOP, center=True)[0][:n_frames]
     if len(rms) < n_frames:
         rms = np.pad(rms, (0, n_frames - len(rms)))
-    floor = np.percentile(rms, 10)  # the stem's noise floor
-    loud = rms > max(3 * floor, 0.02 * rms.max())
+    # Energy gate, for the frames where CREPE is unsure only: a stem never goes silent when the
+    # recording has a noise floor or a residue of the mix, so a gate on its own would throw away
+    # the whole quiet passages. "floor" = the stem's 10th percentile of RMS.
+    floor = np.percentile(rms, 10)
+    loud = rms > max(1.5 * floor, 0.02 * rms.max())
     onset_env = librosa.onset.onset_strength(y=y, sr=SR, hop_length=HOP)
+    # `delta` is in the envelope's own units, which depend on the recording level: make it
+    # relative (5 % of the loud attacks) so a repeated note is split on a quiet take too.
     onset_frames = librosa.onset.onset_detect(
         onset_envelope=onset_env, sr=SR, hop_length=HOP, units="frames", backtrack=False,
-        pre_max=3, post_max=3, pre_avg=10, post_avg=10, delta=0.15, wait=6,
+        pre_max=3, post_max=3, pre_avg=10, post_avg=10, delta=0.05 * float(np.percentile(onset_env, 95)), wait=6,
     )
     onset_set = set(int(f) for f in onset_frames)
     onset_env = onset_env[:n_frames] / (np.percentile(onset_env, 95) or 1.0)
@@ -115,8 +122,17 @@ def extract_melody(
     def decode(log_em):
         path = _viterbi(log_em, jump_penalty)
         midi_frames = midi_of_bin[lo + path]
-        confidence = probs[np.arange(n_frames), lo + path]  # raw CREPE probability of the chosen bin
-        voiced = _close_gaps((confidence >= voicing) & loud, max_len=3)  # 30 ms dropout != rest
+        # Confidence = CREPE's probability of the chosen pitch, octave errors forgiven: when the
+        # register prior moves the path an octave up or down from what CREPE heard, the frame is
+        # still a confident pitch detection (the octave was wrong, not the note).
+        rows = np.arange(n_frames)
+        bins_ = lo + path
+        confidence = probs[rows, bins_]
+        for d in (-60, 60):  # 12 semitones = 60 bins of 20 cents
+            alt = np.clip(bins_ + d, 0, 359)
+            confidence = np.maximum(confidence, np.where((bins_ + d >= 0) & (bins_ + d < 360), probs[rows, alt], 0.0))
+        voiced = (confidence >= sure) | ((confidence >= voicing) & loud)
+        voiced = _close_gaps(voiced, max_len=3)  # a 30 ms dropout inside a note is not a rest
         notes = _segment(midi_frames, voiced, rms, onset_set, times, min_frames=min_frames)
         return notes, voiced
 
@@ -129,7 +145,8 @@ def extract_melody(
     # 4. Octave of each note from the melodic line, then re-join the fragments of one note.
     #    Attack strength (0..1) = peak of the onset envelope at the note start: a re-bowed note has
     #    a clear one, a fragment cut by a pitch wobble or a dropout has not.
-    notes = _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high)
+    notes = _drop_foreign_blips(notes, probs, midi_of_bin, midi_low, midi_high, register)
+    notes = _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, register=register, times=times)
     notes = [(s, e, p, a, fs, fe, float(np.clip(onset_env[max(0, fs - 2):fs + 3].max(), 0, 1)))
              for s, e, p, a, fs, fe in notes]
     notes = _merge_fragments(notes, onset_set)
@@ -169,14 +186,45 @@ def _leap_cost(semitones: int, step_cost=0.12, leap_cost=0.45, easy=7) -> float:
     return step_cost * min(semitones, easy) + leap_cost * max(semitones - easy, 0)
 
 
-def _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, min_ratio=0.1):
+def _drop_foreign_blips(notes, probs, midi_of_bin, midi_low, midi_high, register, short_s=0.15, far=9, min_ratio=0.1):
+    """
+    A fragment shorter than `short_s`, more than `far` semitones from the melody's register, whose
+    octave nearest the register has no CREPE evidence (< `min_ratio` of the fragment's own mass) is
+    not an octave error of the melody: it is the accompaniment heard in a gap. Dropped, because
+    left in it would anchor the octave choice of the notes around it (see _fix_octaves).
+    """
+    if register is None or len(notes) < 3:
+        return notes
+    kept = []
+    for n in notes:
+        s, e, p, _a, fs, fe = n
+        reg = float(register[min(fs, len(register) - 1)])
+        if e - s < short_s and abs(p - reg) > far:
+            alt = p + 12 if p < reg else p - 12
+            if not (midi_low <= alt <= midi_high):
+                continue
+            own = probs[fs:fe][:, np.abs(midi_of_bin - p) <= 0.5].sum(axis=1).mean()
+            other = probs[fs:fe][:, np.abs(midi_of_bin - alt) <= 0.5].sum(axis=1).mean()
+            if other < min_ratio * max(own, 1e-9):
+                continue
+        kept.append(n)
+    return kept
+
+
+def _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, register=None, times=None,
+                 min_ratio=0.1, register_cost=0.15, register_free=5, anchor_s=0.3):
     """
     When the accompaniment shares a pitch class with the melody, CREPE hesitates between octaves
     (Bb4 or Bb5?) and sometimes picks the wrong one for a note in the middle of a phrase. For each
     note, every octave whose CREPE mass is at least `min_ratio` of the best one is a candidate; the
-    octaves are then chosen jointly along the line (Viterbi) to keep the melody stepwise: the
-    evidence for an octave (log of its mass relative to the best) minus the cost of the leap from
-    the previous note (see _leap_cost).
+    octaves are then chosen jointly along the line (Viterbi):
+      * evidence: log of the octave's mass relative to the best one,
+      * minus `register_cost` per semitone beyond `register_free` from the melody's local register
+        (`register`, per frame, from the first pass) — the accompaniment doubling the line an
+        octave below can carry as much mass as the line itself,
+      * minus the cost of the leap from the previous note (see _leap_cost), scaled down when
+        either note is shorter than `anchor_s`: a 100 ms fragment must not anchor the octave of
+        the notes around it.
     """
     if not notes:
         return notes
@@ -187,23 +235,34 @@ def _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, min_ratio=0.1):
             sel[midi] = np.abs(midi_of_bin - midi) <= 0.5
         return float(probs[start:end][:, sel[midi]].sum(axis=1).mean())
 
-    cands = []
+    cands, weights = [], []
     for s, e, p, _a, fs, fe in notes:
         opts = {}
         for q in (p - 12, p, p + 12):
             if midi_low <= q <= midi_high:
                 opts[q] = mass(fs, fe, q)
         best = max(opts.values()) or 1e-9
-        cands.append({q: np.log(max(m, 1e-9) / best) for q, m in opts.items() if m >= min_ratio * best})
+        reg = float(register[min(fs, len(register) - 1)]) if register is not None else None
+        c = {}
+        for q, m in opts.items():
+            if m < min_ratio * best:
+                continue
+            ev = np.log(max(m, 1e-9) / best)
+            if reg is not None:
+                ev -= register_cost * max(0.0, abs(q - reg) - register_free)
+            c[q] = ev
+        cands.append(c)
+        weights.append(min(1.0, (e - s) / anchor_s))
 
     # Viterbi over notes: score = evidence - leap cost
     score = [dict(cands[0])]
     back = [{}]
     for i in range(1, len(cands)):
         cur, bk = {}, {}
+        w = min(weights[i - 1], weights[i])
         for q, ev in cands[i].items():
-            prev_q = max(score[-1], key=lambda pq: score[-1][pq] - _leap_cost(abs(q - pq)))
-            cur[q] = score[-1][prev_q] - _leap_cost(abs(q - prev_q)) + ev
+            prev_q = max(score[-1], key=lambda pq: score[-1][pq] - w * _leap_cost(abs(q - pq)))
+            cur[q] = score[-1][prev_q] - w * _leap_cost(abs(q - prev_q)) + ev
             bk[q] = prev_q
         score.append(cur)
         back.append(bk)
@@ -219,11 +278,10 @@ def _fix_octaves(notes, probs, midi_of_bin, midi_low, midi_high, min_ratio=0.1):
 def _merge_fragments(notes, onset_set, max_gap_s=0.15, weak_attack=0.6, blip_s=0.1):
     """
     Re-join what the segmentation broke:
-      * two notes of the same pitch, contiguous (<= 60 ms apart) with no onset detected between
-        them: a vibrato that strayed a semitone and came back (its spectral flux looks like a
-        weak attack, so the attack strength alone would not tell);
-      * two notes of the same pitch, close together (<= `max_gap_s`), the second one without a
-        clear attack: one note with a dropout (a soft start before the bow bites);
+      * two notes of the same pitch with no onset detected between them, either contiguous
+        (<= 60 ms apart: a vibrato that strayed a semitone and came back) or close together
+        (<= `max_gap_s`) with the second one lacking a clear attack (a dropout, a soft start
+        before the bow bites);
       * a note shorter than `blip_s` without a clear attack: a finger or tracking accident in the
         middle of the previous note, which goes on. (A real short note, an ornament or a passing
         sixteenth, is bowed: its attack is clear and it is kept.)
@@ -235,9 +293,11 @@ def _merge_fragments(notes, onset_set, max_gap_s=0.15, weak_attack=0.6, blip_s=0
         prev = merged[-1]
         s, e, p, a, fs, fe, attack = n
         gap = s - prev[1]
-        contiguous = gap <= 0.06 and not any(prev[5] < f <= fs for f in onset_set)
-        same = p == prev[2] and (contiguous or (gap <= max_gap_s and attack < weak_attack))
-        blip = e - s < blip_s and attack < 0.7
+        # A detected onset between the two is a re-articulation: never merged here (the notation
+        # step re-joins it only if the energy shows no real re-attack, see _merge_false_splits).
+        onset_between = any(prev[5] <= f <= fs for f in onset_set)  # a cut is made AT the onset frame
+        same = p == prev[2] and not onset_between and (gap <= 0.06 or (gap <= max_gap_s and attack < weak_attack))
+        blip = e - s < blip_s and attack < 0.7 and not onset_between
         if same or blip:
             if same or p == prev[2]:
                 prev[1], prev[3], prev[5] = e, max(prev[3], a), fe
