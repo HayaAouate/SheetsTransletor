@@ -1,0 +1,46 @@
+# SheetsTranslator — transcription service.
+#
+#   PC (test, with its own Caddy):   docker compose --profile standalone up -d --build
+#                                    -> http://localhost/api/docs
+#   VPS (Caddy already running):     COMPOSE_FILE=docker-compose.yml:docker-compose.vps.yml in .env, then
+#                                    docker compose up -d --build   (see docker-compose.vps.yml)
+services:
+  api:
+    build: .
+    container_name: sheetstranslator-api     # the name Caddy uses: reverse_proxy sheetstranslator-api:8000
+    restart: unless-stopped
+    volumes:
+      - ./data:/data        # transcriptions (database + files): the history
+      - models:/models      # downloaded models and the CREPE cache: keep across rebuilds
+    environment:
+      - API_KEY=${API_KEY:?API_KEY manquante dans .env (python -c "import secrets; print(secrets.token_urlsafe(32))")}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - ROOT_PATH=/api
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
+      - MAX_AUDIO_MIN=${MAX_AUDIO_MIN:-10}
+      - MAX_PENDING=${MAX_PENDING:-5}
+      - AUDIO_RETENTION_DAYS=${AUDIO_RETENTION_DAYS:-30}
+      - ERROR_RETENTION_DAYS=${ERROR_RETENTION_DAYS:-2}
+      - STORAGE_MAX_GB=${STORAGE_MAX_GB:-5}
+    mem_limit: 6g           # one job at a time needs 3-4 GB; leave room for the OS on an 8 GB VPS
+    ports:
+      - "127.0.0.1:8000:8000"   # local only; the outside goes through Caddy
+
+  proxy:                    # only for a machine without Caddy (the PC): --profile standalone
+    image: caddy:2
+    profiles: ["standalone"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/caddy/Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    environment:
+      - DOMAIN=${DOMAIN:-:80}   # e.g. DOMAIN=sheets.example.com once the DNS points here -> HTTPS
+    depends_on:
+      - api
+
+volumes:
+  models:
+  caddy_data:

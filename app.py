@@ -30,31 +30,36 @@ st.caption("MVP interne — transcription violon (partition) et guitare (tablatu
 
 configure_lilypond()  # trouve Lilypond + FFmpeg tout seul (PATH ou dossiers d'installation connus)
 
-instrument_choice = st.radio("Instrument", ["Violon", "Guitare"], horizontal=True)
+# Every input widget is keyed on this counter: bumping it (see "+ Nouvelle transcription" at the bottom)
+# gives fresh, empty widgets instead of the values of the previous run.
+gen = st.session_state.setdefault("form_gen", 0)
+
+instrument_choice = st.radio("Instrument", ["Violon", "Guitare"], horizontal=True, key=f"instrument_{gen}")
 instrument_key = "Violin" if instrument_choice == "Violon" else "Guitar"
 
 col_t, col_a = st.columns(2)
-song_title = col_t.text_input("Titre du morceau", placeholder="Die On This Hill").strip()
-song_artist = col_a.text_input("Artiste (optionnel)", placeholder="Sienna Spiro").strip()
-source_type = st.radio("Source audio", ["Fichier local", "Lien YouTube"], horizontal=True)
+song_title = col_t.text_input("Titre du morceau", placeholder="Die On This Hill", key=f"title_{gen}").strip()
+song_artist = col_a.text_input("Artiste (optionnel)", placeholder="Sienna Spiro", key=f"artist_{gen}").strip()
+source_type = st.radio("Source audio", ["Fichier local", "Lien YouTube"], horizontal=True, key=f"source_{gen}")
 
 audio_bytes = None
 audio_name = None
 youtube_url = None
 
 if source_type == "Fichier local":
-    uploaded = st.file_uploader("Fichier audio (mp3, wav, m4a)", type=["mp3", "wav", "m4a"])
+    uploaded = st.file_uploader("Fichier audio (mp3, wav, m4a)", type=["mp3", "wav", "m4a"], key=f"file_{gen}")
     if uploaded is not None:
         audio_bytes = uploaded.getvalue()  # pas .read() : le curseur reste en fin de fichier entre deux reruns
         audio_name = uploaded.name
 else:
-    youtube_url = st.text_input("Lien YouTube (ou Instagram / TikTok)")
+    youtube_url = st.text_input("Lien YouTube (ou Instagram / TikTok)", key=f"url_{gen}")
 
 stem_labels = list(STEM_CHOICES)
 stem_choice = st.selectbox(
     "Piste à isoler avant transcription (Demucs)",
     stem_labels,
     index=stem_labels.index(DEFAULT_STEM[instrument_key]),
+    key=f"stem_{gen}",
     help="Sur une chanson complète, isoler l'instrument est indispensable : sinon voix, basse et batterie "
     "sont transcrites en même temps. Choisis « Aucune » seulement pour un enregistrement solo déjà propre.",
 )
@@ -64,6 +69,7 @@ with st.expander("Réglages avancés"):
         "Détection des notes",
         ["Suivi de mélodie (CREPE) — instrument à une voix", "Basic Pitch — polyphonique"],
         index=0 if instrument_key == "Violin" else 1,
+        key=f"method_{gen}",
         help="Le suivi de mélodie suit la hauteur de la ligne jouée (violon, flûte, voix) : traits rapides "
         "et octaves justes, notes tenues d'un seul tenant. Basic Pitch détecte plusieurs notes à la fois "
         "(guitare, accords) ; les deux réglages ci-dessous ne concernent que lui.",
@@ -218,6 +224,16 @@ if result:
     if result.get("ascii_tab"):
         with st.expander("Tablature (texte)"):
             st.code(result["ascii_tab"], language=None)
+
+    if st.button("＋ Nouvelle transcription", type="primary", use_container_width=True):
+        # Drop the score and give the form fresh widgets, then land at the top of the page.
+        st.session_state.result = None
+        st.session_state.form_gen = gen + 1
+        st.session_state.scroll_top = True
+        st.rerun()
+
+if st.session_state.pop("scroll_top", False):
+    components.html("<script>window.parent.scrollTo({top: 0, behavior: 'instant'});</script>", height=0)
 
 st.divider()
 with st.expander("Limites connues de ce MVP"):

@@ -1,0 +1,15 @@
+# VPS overlay: the API joins the Docker network of the Caddy that already serves the other sites,
+# which proxies sheets.<domain>/api/* to sheetstranslator-api:8000 (block to add to that Caddyfile: see README).
+# Activate it with, in .env:   COMPOSE_FILE=docker-compose.yml:docker-compose.vps.yml
+#                              PROXY_NETWORK=<network of the Caddy container>   (docker network ls)
+services:
+  api:
+    ports: !reset []          # nothing published on the host: Caddy reaches the container directly
+    networks:
+      - default
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:?PROXY_NETWORK manquant dans .env (réseau Docker du Caddy existant)}

@@ -17,6 +17,9 @@ build/
 
 # ─── Fichiers générés par l'app ───────────────────────────────────────────────
 output/
+# transcriptions produites par l'API (api/store.py) et volume Docker des modèles
+data/
+models/
 
 # ─── Modèles Demucs (téléchargés automatiquement, ~80 Mo chacun) ──────────────
 # Stockés dans ~/.cache/torch/hub — pas dans le repo, mais au cas où
@@ -31,6 +34,7 @@ output/
 .env
 .env.*
 *.env
+!.env.example
 
 # ─── Fichiers audio/MIDI temporaires ──────────────────────────────────────────
 *.mp3

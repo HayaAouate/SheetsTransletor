@@ -1,0 +1,11 @@
+# Block to append to ~/app/Caddyfile on the VPS (then: docker exec caddy caddy reload --config /etc/caddy/Caddyfile).
+# DNS: A record  sheets.tracevault.tech -> VPS IP.  The API answers on https://sheets.tracevault.tech/api/
+sheets.tracevault.tech {
+    handle_path /api/* {
+        reverse_proxy sheetstranslator-api:8000
+    }
+    handle {
+        respond "SheetsTranslator API : /api/docs" 200   # the Next.js front will be served here later
+    }
+    encode gzip
+}

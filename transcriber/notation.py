@@ -238,4 +238,5 @@ def export_pdf(score: stream.Score, out_path: str, credit: str = CREDIT):
         )
     if produced_path != out_path:
         os.replace(produced_path, out_path)
+    os.remove(ly_path)  # the .ly source is only worth keeping when Lilypond failed (the error above names it)
     return out_path, xml_path

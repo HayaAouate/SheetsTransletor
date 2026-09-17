@@ -76,13 +76,121 @@ automatiquement au premier usage, dans `~/.cache/torch/hub`.)
 
 ```
 sheetsTransletor/
-├── app.py                      # interface Streamlit
+├── app.py                      # interface Streamlit (outil de dev ; sera remplacée par le front web)
 ├── requirements.txt
-├── transcriber/
-│   ├── audio_input.py          # upload local + téléchargement YouTube (yt-dlp)
-│   ├── separate.py             # isolation d'une piste du mix (Demucs)
-│   ├── transcribe.py           # audio -> notes nettoyées et calées sur le tempo (Basic Pitch + librosa)
-│   ├── notation.py             # notes -> partition PDF/MusicXML (violon, music21+Lilypond)
-│   └── guitar_tabs.py          # notes -> tablature ASCII rythmique + PDF (guitare)
-└── output/                     # fichiers générés (créé automatiquement)
-```# SheetsTransletor
+├── transcriber/                # le cœur métier : audio -> notes -> partition (ne dépend pas de l'API)
+│   ├── audio_input.py          # upload local + téléchargement YouTube/TikTok (yt-dlp)
+│   ├── separate.py             # isolation de la piste mélodique (Demucs, composite other/guitar/vocals)
+│   ├── melody.py               # suivi de hauteur monophonique (CREPE + Viterbi, octaves, notes parasites)
+│   ├── beats.py                # temps et premiers temps (Beat This!)
+│   ├── transcribe.py           # notes -> rythme quantifié sur la grille des temps
+│   ├── notation.py             # notes -> partition PDF/MusicXML (music21 + Lilypond)
+│   ├── guitar_tabs.py          # notes -> tablature ASCII + PDF (guitare)
+│   └── viewer.py               # lecteur de partition avec curseur synchronisé (OSMD)
+├── api/                        # l'API HTTP (FastAPI) — voir api/app.py pour le détail
+│   ├── app.py                  # l'application : middlewares, routes, threads de fond   (uvicorn api.app:app)
+│   ├── settings.py             # TOUTES les variables d'environnement, en un seul endroit
+│   ├── security.py             # la clé d'API (X-API-Key)
+│   ├── schemas.py              # modèles des réponses (contrat avec le front, documenté dans /docs)
+│   ├── routes/                 # health.py, transcriptions.py : une route = une fonction nommée par ce qu'elle fait
+│   ├── storage/                # database.py (lignes SQLite), files.py (le dossier de chaque transcription)
+│   └── workers/                # queue.py (un job à la fois), pipeline.py (la transcription), retention.py (nettoyage)
+├── deploy/
+│   ├── caddy/Caddyfile.local   # le Caddy de test sur le PC (profil `standalone`)
+│   ├── caddy/Caddyfile.vps.snippet     # le bloc sheets.tracevault.tech à coller dans ~/app/Caddyfile
+│   └── vps/docker-compose.service.yml  # le service à coller dans ~/app/docker-compose.yaml
+├── Dockerfile, docker-compose.yml, docker-compose.vps.yml
+├── data/                       # runtime (ignoré par git) : db.sqlite + un dossier par transcription
+└── samples/                    # morceaux de test (jamais dans l'image Docker)
+```
+
+## API HTTP + déploiement Docker (VPS)
+
+Le pipeline est exposé par une API (`api/`) : jobs asynchrones (un à la fois), historique en SQLite,
+fichiers dans `data/<id>/`. Toutes les routes sauf `/health` exigent l'en-tête `X-API-Key` (clé dans `.env`,
+bouton « Authorize » dans `/docs`). En local, hors Docker :
+
+```bash
+.venv\Scripts\uvicorn api.app:app --port 8000
+```
+
+puis http://localhost:8000/docs. Routes : `POST /transcriptions` (multipart : `file` ou `url`, `title`, `artist`,
+`instrument` = Violin | Guitar), `GET /transcriptions` (historique), `GET /transcriptions/{id}` (statut,
+progression, `timeline` pour le curseur, `files` disponibles), `GET /transcriptions/{id}/files/{kind}`
+(pdf | musicxml | midi | preview | stem | original | timeline), `DELETE /transcriptions/{id}`.
+
+Garde-fous (`.env`) : `MAX_UPLOAD_MB=50`, `MAX_AUDIO_MIN=10`, `MAX_PENDING=5`, `URL_HOSTS` (youtube, tiktok…).
+
+### Stockage et nettoyage automatique
+
+Une transcription de 3 min pèse ~10 Mo : l'audio (original mp3, piste isolée et aperçu en **FLAC**, 5× plus
+petit que le WAV) fait tout le poids, la partition + MIDI + MusicXML + timeline < 100 Ko.
+`api/workers/retention.py` tourne toutes les heures :
+
+- job en erreur → supprimé après `ERROR_RETENTION_DAYS=2` ;
+- job terminé non rouvert depuis `AUDIO_RETENTION_DAYS=30` → **audio supprimé, partition conservée**
+  (l'historique et le PDF restent ; seule la lecture avec curseur demande de relancer) ;
+- au-delà de `STORAGE_MAX_GB=5`, l'audio des moins récemment ouvertes est purgé en premier ;
+- un job en attente ou en cours n'est jamais touché. Ouvrir une transcription (`GET /transcriptions/{id}`)
+  remet son compteur à zéro (`last_opened_at`).
+
+### Test sur le PC, à l'identique du VPS (Docker Desktop)
+
+Le VPS a déjà un Caddy (`~/app/docker-compose.yaml`, réseau `publication_network`) qui sert les autres sites :
+on ne lance pas de second Caddy là-bas, le conteneur `sheetstranslator-api` rejoint ce réseau et Caddy lui transmet
+`sheets.tracevault.tech/api/*`. Sur le PC on reproduit exactement ça, avec un Caddy local en `:80` :
+
+```bash
+docker network create publication_network           # une fois
+cp .env.example .env                                # décommenter COMPOSE_PATH_SEPARATOR, COMPOSE_FILE, PROXY_NETWORK
+docker compose --profile standalone up -d --build   # API (aucun port publié) + Caddy local : http://localhost/api/docs
+docker compose logs -f api
+```
+
+Vérifié : `sheetstranslator-api` est sur `publication_network` sans port publié, `http://localhost:8000` refuse,
+`http://localhost/api/health` répond via Caddy ; `POST /api/transcriptions` avec `samples/IMG_4291.mp3`
+→ 45 notes, 7 fichiers, 292 s pour 41 s d'audio (1er job : téléchargement des modèles inclus) ; avec
+l'URL TikTok de référence → 103 notes, 290 s. Image : 3,55 Go.
+
+### Mise en ligne sur le VPS (même modèle que les autres apps : image Docker Hub)
+
+1. Sur le PC : `docker build -t miaouu/sheetstranslator-api:latest . && docker push miaouu/sheetstranslator-api:latest`
+2. Sur le VPS, dans `~/app/docker-compose.yaml` : ajouter le service de `deploy/vps/docker-compose.service.yml`
+   (+ le volume `sheetstranslator_models`).
+3. Dans `~/app/Caddyfile` : ajouter le bloc de `deploy/caddy/Caddyfile.vps.snippet`, et un enregistrement DNS `A`
+   `sheets.tracevault.tech` → IP du VPS.
+4. `cd ~/app && docker compose pull sheetstranslator-api && docker compose up -d sheetstranslator-api && docker exec caddy caddy reload --config /etc/caddy/Caddyfile`
+
+L'API répond sur `https://sheets.tracevault.tech/api/` (docs : `/api/docs`). Les transcriptions sont dans
+`~/app/sheetstranslator/data` (à sauvegarder), les modèles dans le volume `sheetstranslator_models`. Aucun port à ouvrir :
+seul Caddy (80/443) est exposé. Alternative sans Docker Hub : cloner le dépôt sur le VPS et
+`docker compose up -d --build` avec le même `.env` que sur le PC (`docker-compose.vps.yml`).
+
+Dimensionnement : une transcription prend 3–4 Go de RAM et tourne sur tous les cœurs ; sur un VPS 2 vCPU / 8 Go,
+compter ~5–8× la durée du morceau. `mem_limit: 6g` dans `docker-compose.yml` protège le système.
+
+### Temps de calcul : CPU vs GPU
+
+Demucs (séparation) représente ~75 % du temps, CREPE ~15 %, le reste (Beat This!, Lilypond, synthèse) < 1 min.
+Ce sont des réseaux de neurones : le gain avec plus de cœurs CPU est linéaire, un GPU va 10–20× plus vite.
+
+| Machine | Titre de 3 min (estimation, à mesurer dans les logs `terminé en Xs`) |
+|---|---|
+| KVM 2 (2 vCPU) — actuel | 15–25 min |
+| KVM 4 / KVM 8 | 8–12 min / 4–6 min |
+| GPU d'entrée de gamme (T4, RTX 4090) | ~1 min |
+
+Options, de la moins chère à la plus rapide :
+
+1. **Rester en CPU sur KVM 2** : file d'attente, job en arrière-plan, historique. Pour les enregistrements solo
+   (violon seul, sans accompagnement) choisir « sans séparation » évite Demucs → 2–3 min.
+2. **GPU serverless (RunPod Serverless, Modal)** pour Demucs + CREPE uniquement, facturé à la seconde :
+   < 1 centime par titre, 0 € quand personne n'utilise l'app, résultat en 1–2 min (démarrage à froid inclus).
+   Le VPS garde l'API, l'historique, la file et le PDF ; une variable d'environnement (`GPU_ENDPOINT`) suffira,
+   sans elle on retombe sur le CPU local.
+3. **GPU Hostinger** (RTX 4090 0,42 $/h, L40S 0,96 $/h, A100 1,55 $/h, facturé à la minute) : **facturé tant que
+   l'instance existe, même éteinte** — seule la destruction arrête les frais, et elle efface tout. ~300 $/mois
+   pour une 4090 qui dort : à éviter pour un usage intermittent.
+
+Décision : on déploie d'abord sur KVM 2 en CPU (ça marche, c'est juste lent), et on branche le GPU serverless
+quand on veut passer à 1–2 min.

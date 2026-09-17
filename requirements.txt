@@ -11,3 +11,6 @@ torchcrepe>=0.0.24  # CREPE pitch tracking (melody.py) — PyTorch, already pull
 beat_this @ git+https://github.com/CPJKU/beat_this  # beat + downbeat tracking (beats.py); model (~77 MB) downloaded on first use
 numba==0.61.2  # newer numba builds (0.67) get blocked by Windows Smart App Control ("stratégie de contrôle d'application"); this one is allowed
 llvmlite==0.44.0
+fastapi>=0.110  # HTTP API (api/)
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9

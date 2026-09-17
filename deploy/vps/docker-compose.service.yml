@@ -1,0 +1,34 @@
+# Service to add to ~/app/docker-compose.yaml on the VPS, next to the other apps (same network as caddy).
+# Image built on the PC and pushed to Docker Hub:  docker build -t miaouu/sheetstranslator-api:latest . && docker push ...
+# Then on the VPS:  cd ~/app && docker compose pull sheetstranslator-api && docker compose up -d sheetstranslator-api
+services:
+  sheetstranslator-api:
+    image: miaouu/sheetstranslator-api:latest
+    container_name: sheetstranslator-api
+    restart: unless-stopped
+    expose:
+      - "8000"                       # reached by caddy only (reverse_proxy sheetstranslator-api:8000), never published
+    environment:
+      - API_KEY=${SHEETS_API_KEY:?SHEETS_API_KEY manquante dans ~/app/.env}   # X-API-Key required on every route but /health
+      - ROOT_PATH=/api
+      - CORS_ORIGINS=*
+      - MAX_UPLOAD_MB=50
+      - MAX_AUDIO_MIN=10
+      - MAX_PENDING=5
+      - AUDIO_RETENTION_DAYS=30
+      - STORAGE_MAX_GB=5
+    mem_limit: 6g                    # one transcription needs 3-4 GB; keeps the other containers + OS safe on 8 GB
+    volumes:
+      - ./sheetstranslator/data:/data       # transcriptions (history): back this folder up
+      - sheetstranslator_models:/models     # models downloaded on first job (~400 MB), kept across updates
+    networks:
+      - app-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+# and in the top-level `volumes:` section:
+volumes:
+  sheetstranslator_models:

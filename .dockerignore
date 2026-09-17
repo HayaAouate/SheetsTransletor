@@ -1,0 +1,15 @@
+.venv
+.git
+data
+models
+samples
+__pycache__
+**/__pycache__
+*.pyc
+.claude
+tools
+BACKLOG.md
+README.md
+deploy
+docker-compose*.yml
+.env*

@@ -4,8 +4,44 @@
     {
       "name": "viewer-test",
       "runtimeExecutable": "C:/Users/haya/Documents/Fun/sheetsTransletor/.venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "http.server", "8765", "--directory", "C:/Users/haya/AppData/Local/Temp/claude/C--Users-haya-Documents-Fun-sheetsTransletor/e74ae99e-eed2-46ff-9fee-a9e43b64013c/scratchpad"],
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8765",
+        "--directory",
+        "C:/Users/haya/AppData/Local/Temp/claude/C--Users-haya-Documents-Fun-sheetsTransletor/e74ae99e-eed2-46ff-9fee-a9e43b64013c/scratchpad"
+      ],
       "port": 8765
+    },
+    {
+      "name": "api",
+      "runtimeExecutable": "C:/Users/haya/Documents/Fun/sheetsTransletor/.venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "uvicorn",
+        "api.app:app",
+        "--port",
+        "8000"
+      ],
+      "port": 8000,
+      "env": {
+        "API_KEY": "dev-local-key-not-a-secret"
+      }
+    },
+    {
+      "name": "streamlit",
+      "runtimeExecutable": "C:/Users/haya/Documents/Fun/sheetsTransletor/.venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "app.py",
+        "--server.port",
+        "8501",
+        "--server.headless",
+        "true"
+      ],
+      "port": 8501
     }
   ]
 }

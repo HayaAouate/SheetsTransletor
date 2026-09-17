@@ -1,0 +1,11 @@
+# Local stand-in for the VPS Caddy (profile "standalone"): same routing block as deploy/caddy/Caddyfile.vps.snippet,
+# on DOMAIN=:80 (plain HTTP on the PC) instead of sheets.tracevault.tech.
+{$DOMAIN} {
+    handle_path /api/* {
+        reverse_proxy sheetstranslator-api:8000
+    }
+    handle {
+        respond "SheetsTranslator API : /api/docs" 200
+    }
+    encode gzip
+}
